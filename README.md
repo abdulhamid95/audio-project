@@ -1,97 +1,97 @@
-# AI Tutorial Audio Refiner
+# AI Audio Refiner
 
 A Streamlit web application that automatically cleans up tutorial recordings using AI-powered audio processing.
 
 ## Features
 
-- **Noise Reduction** - Removes background static and hiss
-- **Smart Repetition Removal** - Uses AI (Whisper) to detect and remove repeated phrases, keeping only the final take
-- **Silence Trimming** - Trims long pauses to improve pacing
+- **Noise Reduction** - Removes background static/hiss using the first 0.5s as noise profile
+- **Smart Repetition Removal** - Uses Whisper AI with "The Last Take Strategy":
+  - Detects repeated phrases (>85% similarity)
+  - Detects false starts (incomplete sentences followed by complete ones)
+  - Always keeps the last take, removes earlier attempts
+- **Silence Trimming** - Truncates silences >800ms down to 100ms for natural pacing
 
 ## Requirements
 
 - Python 3.10+
-- FFmpeg (must be installed on your system)
+- FFmpeg
 
 ## Installation
 
-1. Clone the repository:
 ```bash
+# Clone the repository
 git clone https://github.com/abdulhamid95/audio-project.git
 cd audio-project
-```
 
-2. Create and activate a virtual environment:
-```bash
+# Create virtual environment
 python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# On Linux/macOS:
-source venv/bin/activate
-
-# On Windows:
-venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-4. Install FFmpeg (if not already installed):
+### Install FFmpeg
+
 ```bash
-# Ubuntu/Debian:
+# Ubuntu/Debian
 sudo apt install ffmpeg
 
-# macOS:
+# macOS
 brew install ffmpeg
 
-# Windows:
-# Download from https://ffmpeg.org/download.html and add to PATH
+# Windows
+# Download from https://ffmpeg.org/download.html
 ```
 
 ## Usage
 
-Run the Streamlit app:
 ```bash
 streamlit run app.py
 ```
 
-The app will open in your browser at http://localhost:8501
+Open http://localhost:8501 in your browser.
 
-### Processing Options
+### Processing Options (Sidebar)
 
-- **Remove Long Silences** - Trims silences longer than 800ms
-- **Silence Threshold (dB)** - Adjust what volume level is considered silence (-60 to -20 dB)
-- **Remove Repetitions** - AI-powered detection and removal of repeated phrases
-- **Noise Reduction Intensity** - Control strength of noise removal (0.0 to 1.0)
+| Option | Default | Description |
+|--------|---------|-------------|
+| Remove Noise | On | Apply noise reduction |
+| Remove Repetitions | On | AI-powered repetition detection |
+| Silence Threshold | -40 dB | Audio below this is silence |
 
 ### Supported Formats
 
-- MP3
 - WAV
-- Audacity Project (.aup3)
+- MP3
+- Audacity Project (.aup3) - requires FFmpeg codec support
 
 ## Project Structure
 
 ```
-├── app.py              # Streamlit web interface
-├── processor.py        # Audio processing pipeline
-├── main.py             # CLI tool (alternative to web UI)
-├── audio_editor/       # Core audio processing modules
-│   ├── converter.py    # Format conversion (FFmpeg)
-│   ├── denoiser.py     # Noise reduction
-│   ├── transcriber.py  # Whisper transcription
-│   ├── repetition.py   # Repetition detection/removal
-│   └── silence.py      # Silence detection/trimming
+├── app.py           # Streamlit UI
+├── processor.py     # AudioProcessor class (core logic)
+├── utils.py         # File conversion helpers
+├── main.py          # CLI alternative
+├── audio_editor/    # Legacy module (can be removed)
 └── requirements.txt
 ```
 
-## CLI Usage (Alternative)
+## How Repetition Detection Works
 
-You can also use the command-line tool:
+The "Last Take Strategy" algorithm:
+
+1. Transcribe audio with Whisper to get timestamped segments
+2. Compare consecutive segments:
+   - **Repetition**: `SequenceMatcher(a, b).ratio() > 0.85`
+   - **False Start**: Segment A is a prefix of Segment B
+3. Mark the FIRST segment for deletion (keep the last take)
+4. Reconstruct audio excluding deleted ranges
+
+## CLI Usage
+
 ```bash
 python main.py recording.wav -o cleaned.wav
 python main.py recording.wav --skip-denoise --similarity 0.85
+python main.py --help
 ```
-
-Run `python main.py --help` for all options.

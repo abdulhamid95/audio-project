@@ -1,142 +1,365 @@
-"""Audio processing pipeline for the web application."""
+"""Core audio processing logic - The Brain."""
 
 import os
-import tempfile
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Callable
 
-from audio_editor import (
-    convert_to_wav,
-    reduce_noise,
-    transcribe_audio,
-    detect_repetitions,
-    remove_repetitions,
-    trim_silences,
-)
+import numpy as np
+from scipy.io import wavfile
+import noisereduce as nr
+from pydub import AudioSegment
+from faster_whisper import WhisperModel
 
 
 @dataclass
-class ProcessingResult:
-    """Result of audio processing."""
-    output_path: str
-    stages_completed: list[str]
-    repetitions_removed: float  # seconds
-    silence_trimmed: float  # seconds
-    error: str | None = None
+class Segment:
+    """A transcribed segment with timing."""
+    text: str
+    start: float
+    end: float
 
 
-def process_audio_file(
-    input_path: str,
-    output_dir: str,
-    remove_silence: bool = True,
-    silence_threshold_db: float = -40.0,
-    remove_repetitions_enabled: bool = True,
-    noise_reduction_intensity: float = 0.8,
-    progress_callback: Callable[[float, str], None] | None = None,
-) -> ProcessingResult:
+@dataclass
+class DeletionRange:
+    """A time range marked for deletion."""
+    start: float
+    end: float
+    reason: str
+
+
+class AudioProcessor:
     """
-    Process an audio file through the cleaning pipeline.
+    Audio processing pipeline implementing "The Last Take Strategy".
 
-    Args:
-        input_path: Path to the uploaded audio file.
-        output_dir: Directory to save output files.
-        remove_silence: Whether to trim long silences.
-        silence_threshold_db: Threshold for silence detection (dB).
-        remove_repetitions_enabled: Whether to detect and remove repetitions.
-        noise_reduction_intensity: Noise reduction strength (0.0 to 1.0).
-        progress_callback: Function(progress: float, message: str) for updates.
-
-    Returns:
-        ProcessingResult with output path and statistics.
+    Pipeline:
+    A. Noise Reduction
+    B. Smart Repetition Removal
+    C. Silence Removal
     """
-    stages_completed = []
-    repetitions_removed = 0.0
-    silence_trimmed = 0.0
 
-    def update_progress(progress: float, message: str):
-        if progress_callback:
-            progress_callback(progress, message)
+    def __init__(
+        self,
+        whisper_model: WhisperModel,
+        log_callback: Callable[[str], None] | None = None
+    ):
+        """
+        Initialize the processor.
 
-    try:
-        current_file = input_path
+        Args:
+            whisper_model: Pre-loaded Whisper model instance.
+            log_callback: Function to call with log messages.
+        """
+        self.model = whisper_model
+        self.log = log_callback or (lambda x: None)
 
-        # Stage 1: Convert to WAV (0-20%)
-        update_progress(0.05, "Converting to WAV format...")
-        wav_path = convert_to_wav(current_file, output_dir)
-        current_file = wav_path
-        stages_completed.append("Conversion to WAV")
-        update_progress(0.20, "Conversion complete")
+    def process(
+        self,
+        input_path: str,
+        output_path: str,
+        remove_noise: bool = True,
+        remove_repetitions: bool = True,
+        silence_threshold_db: float = -40.0,
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> str:
+        """
+        Run the complete processing pipeline.
 
-        # Stage 2: Noise Reduction (20-40%)
-        if noise_reduction_intensity > 0:
-            update_progress(0.25, "Applying noise reduction...")
-            denoised_path = os.path.join(output_dir, "denoised.wav")
-            current_file = reduce_noise(
-                current_file,
-                denoised_path,
-                prop_decrease=noise_reduction_intensity,
-            )
-            stages_completed.append(f"Noise Reduction ({noise_reduction_intensity:.0%})")
-            update_progress(0.40, "Noise reduction complete")
+        Args:
+            input_path: Path to input WAV file.
+            output_path: Path for output WAV file.
+            remove_noise: Whether to apply noise reduction.
+            remove_repetitions: Whether to detect and remove repetitions.
+            silence_threshold_db: Threshold for silence detection.
+            progress_callback: Function(progress: float) for updates.
 
-        # Stage 3: Repetition Removal (40-70%)
-        if remove_repetitions_enabled:
-            update_progress(0.45, "Transcribing audio with AI...")
-            segments = transcribe_audio(current_file, model_size="base")
-            update_progress(0.55, f"Found {len(segments)} segments, detecting repetitions...")
+        Returns:
+            Path to processed audio file.
+        """
+        update = progress_callback or (lambda x: None)
+        current_path = input_path
 
-            cuts = detect_repetitions(segments)
+        # Step A: Noise Reduction (0-30%)
+        if remove_noise:
+            self.log("Applying noise reduction...")
+            update(0.1)
+            denoised_path = output_path.replace(".wav", "_denoised.wav")
+            current_path = self._reduce_noise(current_path, denoised_path)
+            self.log("Noise reduction complete.")
+            update(0.3)
 
-            if cuts:
-                update_progress(0.60, f"Removing {len(cuts)} repetitions...")
-                no_rep_path = os.path.join(output_dir, "no_repetitions.wav")
-                current_file, repetitions_removed = remove_repetitions(
-                    current_file,
-                    no_rep_path,
-                    cuts,
-                )
-                stages_completed.append(f"Repetition Removal ({repetitions_removed:.1f}s removed)")
+        # Step B: Repetition Removal (30-70%)
+        if remove_repetitions:
+            self.log("Transcribing audio with Whisper AI...")
+            update(0.35)
+            segments = self._transcribe(current_path)
+            self.log(f"Found {len(segments)} speech segments.")
+            update(0.5)
+
+            self.log("Analyzing for repetitions and false starts...")
+            deletions = self._detect_repetitions(segments)
+
+            if deletions:
+                self.log(f"Found {len(deletions)} sections to remove:")
+                for d in deletions:
+                    self.log(f"  - {d.reason}")
+
+                no_rep_path = output_path.replace(".wav", "_norep.wav")
+                current_path = self._remove_segments(current_path, no_rep_path, deletions)
+                self.log("Repetitions removed.")
             else:
-                stages_completed.append("Repetition Detection (none found)")
+                self.log("No repetitions detected.")
+            update(0.7)
 
-            update_progress(0.70, "Repetition processing complete")
+        # Step C: Silence Removal (70-100%)
+        self.log("Detecting and trimming silences...")
+        update(0.75)
+        current_path = self._trim_silences(
+            current_path,
+            output_path,
+            threshold_db=silence_threshold_db
+        )
+        self.log("Silence trimming complete.")
+        update(1.0)
 
-        # Stage 4: Silence Trimming (70-90%)
-        if remove_silence:
-            update_progress(0.75, "Detecting and trimming silences...")
-            trimmed_path = os.path.join(output_dir, "trimmed.wav")
-            current_file, silence_trimmed = trim_silences(
-                current_file,
-                trimmed_path,
-                silence_threshold_db=silence_threshold_db,
-            )
-            stages_completed.append(f"Silence Trimming ({silence_trimmed:.1f}s removed)")
-            update_progress(0.90, "Silence trimming complete")
+        return output_path
 
-        # Stage 5: Final output (90-100%)
-        update_progress(0.95, "Finalizing output...")
-        output_path = os.path.join(output_dir, "processed_output.wav")
+    def _reduce_noise(
+        self,
+        input_path: str,
+        output_path: str,
+        noise_sample_seconds: float = 0.5
+    ) -> str:
+        """Apply noise reduction using noisereduce."""
+        sample_rate, audio_data = wavfile.read(input_path)
 
-        # Copy to final location with proper format
-        from pydub import AudioSegment
-        final_audio = AudioSegment.from_wav(current_file)
-        final_audio.export(output_path, format="wav")
+        # Convert to float
+        if audio_data.dtype == np.int16:
+            audio_float = audio_data.astype(np.float32) / 32768.0
+        elif audio_data.dtype == np.int32:
+            audio_float = audio_data.astype(np.float32) / 2147483648.0
+        else:
+            audio_float = audio_data.astype(np.float32)
 
-        stages_completed.append("Output saved")
-        update_progress(1.0, "Processing complete!")
+        # Handle stereo
+        if len(audio_float.shape) > 1:
+            audio_float = np.mean(audio_float, axis=1)
 
-        return ProcessingResult(
-            output_path=output_path,
-            stages_completed=stages_completed,
-            repetitions_removed=repetitions_removed,
-            silence_trimmed=silence_trimmed,
+        # Use first N seconds as noise profile
+        noise_samples = int(noise_sample_seconds * sample_rate)
+        noise_clip = audio_float[:noise_samples]
+
+        # Apply noise reduction
+        reduced = nr.reduce_noise(
+            y=audio_float,
+            sr=sample_rate,
+            y_noise=noise_clip,
+            prop_decrease=0.8,
+            stationary=True,
         )
 
-    except Exception as e:
-        return ProcessingResult(
-            output_path="",
-            stages_completed=stages_completed,
-            repetitions_removed=repetitions_removed,
-            silence_trimmed=silence_trimmed,
-            error=str(e),
+        # Normalize
+        max_val = np.max(np.abs(reduced))
+        if max_val > 0:
+            reduced = reduced / max_val * 0.95
+
+        # Save
+        reduced_int = (reduced * 32767).astype(np.int16)
+        wavfile.write(output_path, sample_rate, reduced_int)
+
+        return output_path
+
+    def _transcribe(self, audio_path: str) -> list[Segment]:
+        """Transcribe audio using Whisper."""
+        segments_gen, _ = self.model.transcribe(
+            audio_path,
+            word_timestamps=True,
+            vad_filter=True,
         )
+
+        segments = []
+        for seg in segments_gen:
+            text = seg.text.strip()
+            if text:
+                start = seg.words[0].start if seg.words else seg.start
+                end = seg.words[-1].end if seg.words else seg.end
+                segments.append(Segment(text=text, start=start, end=end))
+
+        return segments
+
+    def _detect_repetitions(
+        self,
+        segments: list[Segment],
+        similarity_threshold: float = 0.85
+    ) -> list[DeletionRange]:
+        """
+        Detect repetitions using "The Last Take Strategy".
+
+        Conditions for deletion:
+        1. Fuzzy match: SequenceMatcher ratio > 0.85
+        2. False start: Segment[i] is substring of start of Segment[i+1]
+
+        The FIRST segment is marked for deletion (keep the last take).
+        """
+        if len(segments) < 2:
+            return []
+
+        deletions = []
+
+        for i in range(len(segments) - 1):
+            curr = segments[i]
+            next_seg = segments[i + 1]
+
+            curr_text = curr.text.lower().strip()
+            next_text = next_seg.text.lower().strip()
+
+            should_delete = False
+            reason = ""
+
+            # Condition 1: Fuzzy match (repetition)
+            ratio = SequenceMatcher(None, curr_text, next_text).ratio()
+            if ratio > similarity_threshold:
+                should_delete = True
+                reason = f"Repetition ({ratio:.0%} similar): '{curr.text[:40]}...' -> Removed"
+
+            # Condition 2: False start (substring at beginning)
+            elif len(curr_text) > 3 and next_text.startswith(curr_text[:len(curr_text)]):
+                should_delete = True
+                reason = f"False start: '{curr.text[:30]}...' -> Removed"
+
+            # Also check if current is a short prefix of next (common stutter pattern)
+            elif len(curr_text) < len(next_text) * 0.5:
+                # Check if current text words appear at start of next
+                curr_words = curr_text.split()
+                next_words = next_text.split()
+                if len(curr_words) >= 1 and len(next_words) >= len(curr_words):
+                    if curr_words == next_words[:len(curr_words)]:
+                        should_delete = True
+                        reason = f"Incomplete phrase: '{curr.text[:30]}...' -> Removed"
+
+            if should_delete:
+                deletions.append(DeletionRange(
+                    start=curr.start,
+                    end=curr.end,
+                    reason=reason
+                ))
+
+        return deletions
+
+    def _remove_segments(
+        self,
+        input_path: str,
+        output_path: str,
+        deletions: list[DeletionRange]
+    ) -> str:
+        """Remove marked segments from audio."""
+        audio = AudioSegment.from_wav(input_path)
+
+        # Sort by start time
+        sorted_dels = sorted(deletions, key=lambda x: x.start)
+
+        # Build output by keeping non-deleted parts
+        result = AudioSegment.empty()
+        current_pos = 0.0
+
+        for d in sorted_dels:
+            # Keep audio before this deletion
+            if d.start > current_pos:
+                start_ms = int(current_pos * 1000)
+                end_ms = int(d.start * 1000)
+                result += audio[start_ms:end_ms]
+            current_pos = max(current_pos, d.end)
+
+        # Keep audio after last deletion
+        if current_pos * 1000 < len(audio):
+            result += audio[int(current_pos * 1000):]
+
+        result.export(output_path, format="wav")
+        return output_path
+
+    def _trim_silences(
+        self,
+        input_path: str,
+        output_path: str,
+        threshold_db: float = -40.0,
+        min_silence_ms: int = 800,
+        target_silence_ms: int = 100
+    ) -> str:
+        """
+        Detect silences > min_silence_ms and truncate to target_silence_ms.
+
+        This keeps pacing natural instead of completely removing silences.
+        """
+        sample_rate, audio_data = wavfile.read(input_path)
+
+        # Convert to float
+        if audio_data.dtype == np.int16:
+            audio_float = audio_data.astype(np.float32) / 32768.0
+        elif audio_data.dtype == np.int32:
+            audio_float = audio_data.astype(np.float32) / 2147483648.0
+        else:
+            audio_float = audio_data.astype(np.float32)
+
+        if len(audio_float.shape) > 1:
+            audio_float = np.mean(audio_float, axis=1)
+
+        # Detect silence regions
+        threshold_linear = 10 ** (threshold_db / 20)
+        window_size = int(sample_rate * 0.02)  # 20ms windows
+        hop_size = window_size // 2
+
+        silence_regions = []
+        in_silence = False
+        silence_start = 0
+
+        for i in range(0, len(audio_float) - window_size, hop_size):
+            window = audio_float[i:i + window_size]
+            rms = np.sqrt(np.mean(window ** 2))
+            current_time = i / sample_rate
+
+            if rms < threshold_linear:
+                if not in_silence:
+                    in_silence = True
+                    silence_start = current_time
+            else:
+                if in_silence:
+                    duration_ms = (current_time - silence_start) * 1000
+                    if duration_ms >= min_silence_ms:
+                        silence_regions.append((silence_start, current_time))
+                    in_silence = False
+
+        # Handle trailing silence
+        if in_silence:
+            end_time = len(audio_float) / sample_rate
+            duration_ms = (end_time - silence_start) * 1000
+            if duration_ms >= min_silence_ms:
+                silence_regions.append((silence_start, end_time))
+
+        if not silence_regions:
+            # No long silences, just copy
+            audio = AudioSegment.from_wav(input_path)
+            audio.export(output_path, format="wav")
+            return output_path
+
+        # Trim silences using pydub
+        audio = AudioSegment.from_wav(input_path)
+        target_sec = target_silence_ms / 1000.0
+        result = audio
+
+        # Process from end to start to avoid position shifts
+        for start, end in reversed(silence_regions):
+            silence_duration = end - start
+            trim_amount = silence_duration - target_sec
+
+            if trim_amount > 0:
+                # Keep half of target at start, half at end
+                keep_start = target_sec / 2
+                keep_end = target_sec / 2
+
+                trim_start_ms = int((start + keep_start) * 1000)
+                trim_end_ms = int((end - keep_end) * 1000)
+
+                result = result[:trim_start_ms] + result[trim_end_ms:]
+
+        result.export(output_path, format="wav")
+        return output_path
