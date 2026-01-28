@@ -20,6 +20,7 @@ class Segment:
     text: str
     start: float
     end: float
+    index: int = 0  # Position in original segment list
 
 
 @dataclass
@@ -28,6 +29,40 @@ class DeletionRange:
     start: float
     end: float
     reason: str
+
+
+@dataclass
+class RepetitionCandidate:
+    """A potential repetition pair for review."""
+    segment_a: Segment  # The earlier (potentially incomplete) segment
+    segment_b: Segment  # The later (potentially complete) segment
+    similarity: float   # Similarity ratio (0.0 - 1.0)
+    normalized_a: str   # Normalized text of segment A
+    normalized_b: str   # Normalized text of segment B
+    recommended_delete: str  # "a" or "b" - which one to delete (shorter/incomplete)
+
+    def get_deletion_for(self, choice: str) -> DeletionRange:
+        """Get deletion range for the chosen segment."""
+        if choice == "a":
+            return DeletionRange(
+                start=self.segment_a.start,
+                end=self.segment_a.end,
+                reason=f"User confirmed: '{self.segment_a.text[:30]}...'"
+            )
+        else:
+            return DeletionRange(
+                start=self.segment_b.start,
+                end=self.segment_b.end,
+                reason=f"User confirmed: '{self.segment_b.text[:30]}...'"
+            )
+
+
+@dataclass
+class RepetitionAnalysis:
+    """Results of repetition analysis with three tiers."""
+    auto_delete: list[DeletionRange]      # Tier 1: >85% - auto delete
+    needs_review: list[RepetitionCandidate]  # Tier 2: 70-85% - needs user review
+    segments: list[Segment]               # All transcribed segments
 
 
 class AudioProcessor:
@@ -66,7 +101,7 @@ class AudioProcessor:
         progress_callback: Callable[[float], None] | None = None,
     ) -> str:
         """
-        Run the complete processing pipeline.
+        Run the complete processing pipeline (non-interactive mode).
 
         Args:
             input_path: Path to input WAV file.
@@ -119,6 +154,99 @@ class AudioProcessor:
         # Step C: Silence Removal (70-100%)
         self.log("Detecting and trimming silences...")
         update(0.75)
+        current_path = self._trim_silences(
+            current_path,
+            output_path,
+            threshold_db=silence_threshold_db
+        )
+        self.log("Silence trimming complete.")
+        update(1.0)
+
+        return output_path
+
+    def process_phase1_prepare(
+        self,
+        input_path: str,
+        temp_dir: str,
+        remove_noise: bool = True,
+        language: str | None = "ar",
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> tuple[str, RepetitionAnalysis | None]:
+        """
+        Phase 1: Prepare audio and analyze repetitions (interactive mode).
+
+        Returns:
+            Tuple of (prepared_audio_path, repetition_analysis or None)
+        """
+        update = progress_callback or (lambda x: None)
+        current_path = input_path
+
+        # Step A: Noise Reduction (0-30%)
+        if remove_noise:
+            self.log("Applying noise reduction...")
+            update(0.1)
+            denoised_path = os.path.join(temp_dir, "denoised.wav")
+            current_path = self._reduce_noise(current_path, denoised_path)
+            self.log("Noise reduction complete.")
+            update(0.3)
+
+        # Step B: Transcription and Analysis (30-60%)
+        lang_str = language if language else "auto-detect"
+        self.log(f"Transcribing audio with Whisper AI (language: {lang_str})...")
+        update(0.35)
+        segments = self._transcribe(current_path, language=language)
+        self.log(f"Found {len(segments)} speech segments.")
+        update(0.5)
+
+        self.log("Analyzing for repetitions (three-tier system)...")
+        analysis = self.analyze_repetitions(segments)
+
+        self.log(f"Analysis complete:")
+        self.log(f"  - Tier 1 (auto-delete): {len(analysis.auto_delete)} segments")
+        self.log(f"  - Tier 2 (needs review): {len(analysis.needs_review)} pairs")
+        update(0.6)
+
+        return current_path, analysis
+
+    def process_phase2_finalize(
+        self,
+        input_path: str,
+        output_path: str,
+        deletions: list[DeletionRange],
+        silence_threshold_db: float = -40.0,
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> str:
+        """
+        Phase 2: Apply deletions and finalize audio (interactive mode).
+
+        Args:
+            input_path: Path to prepared audio (from phase 1).
+            output_path: Path for final output.
+            deletions: Combined list of all confirmed deletions.
+            silence_threshold_db: Threshold for silence detection.
+            progress_callback: Function(progress: float) for updates.
+
+        Returns:
+            Path to processed audio file.
+        """
+        update = progress_callback or (lambda x: None)
+        current_path = input_path
+
+        # Apply deletions (60-80%)
+        if deletions:
+            self.log(f"Removing {len(deletions)} confirmed segments...")
+            update(0.65)
+            no_rep_path = output_path.replace(".wav", "_norep.wav")
+            current_path = self._remove_segments(current_path, no_rep_path, deletions)
+            self.log("Segments removed.")
+            update(0.8)
+        else:
+            self.log("No segments to remove.")
+            update(0.8)
+
+        # Silence Removal (80-100%)
+        self.log("Detecting and trimming silences...")
+        update(0.85)
         current_path = self._trim_silences(
             current_path,
             output_path,
@@ -262,6 +390,163 @@ class AudioProcessor:
 
         return text
 
+    def analyze_repetitions(
+        self,
+        segments: list[Segment],
+        high_threshold: float = 0.85,
+        low_threshold: float = 0.70,
+        lookahead_window: int = 3,
+        debug: bool = True
+    ) -> RepetitionAnalysis:
+        """
+        Analyze repetitions using three-tier confidence system.
+
+        Tiers:
+        - Tier 1 (>85%): High confidence - auto-delete the shorter/earlier segment
+        - Tier 2 (70-85%): Uncertain - needs user review
+        - Tier 3 (<70%): Different - keep both
+
+        Args:
+            segments: List of transcribed segments.
+            high_threshold: Threshold for auto-delete (default 0.85).
+            low_threshold: Threshold for review (default 0.70).
+            lookahead_window: How many segments ahead to compare (default 3).
+            debug: Print comparison details for debugging.
+
+        Returns:
+            RepetitionAnalysis with auto_delete, needs_review, and segments.
+        """
+        # Add index to segments
+        for i, seg in enumerate(segments):
+            seg.index = i
+
+        if len(segments) < 2:
+            return RepetitionAnalysis(auto_delete=[], needs_review=[], segments=segments)
+
+        auto_delete = []
+        needs_review = []
+        processed_indices = set()
+
+        if debug:
+            print(f"\n{'='*60}")
+            print("REPETITION DETECTION - THREE TIER ANALYSIS")
+            print(f"{'='*60}")
+            print(f"Total segments: {len(segments)}")
+            print(f"Tier 1 (Auto-delete): >{high_threshold:.0%}")
+            print(f"Tier 2 (Review): {low_threshold:.0%}-{high_threshold:.0%}")
+            print(f"Tier 3 (Keep): <{low_threshold:.0%}")
+            print(f"Lookahead window: {lookahead_window}")
+            print(f"{'='*60}\n")
+
+        for i in range(len(segments)):
+            if i in processed_indices:
+                continue
+
+            curr = segments[i]
+            curr_text = self._normalize_text(curr.text)
+            curr_words = curr_text.split()
+
+            for offset in range(1, lookahead_window + 1):
+                j = i + offset
+                if j >= len(segments):
+                    break
+                if j in processed_indices:
+                    continue
+
+                next_seg = segments[j]
+                next_text = self._normalize_text(next_seg.text)
+                next_words = next_text.split()
+
+                # Calculate similarity
+                ratio = SequenceMatcher(None, curr_text, next_text).ratio()
+
+                # Check for false start / prefix match (boost ratio if detected)
+                is_false_start = False
+                if len(curr_text) > 3 and next_text.startswith(curr_text):
+                    is_false_start = True
+                    ratio = max(ratio, high_threshold + 0.01)  # Treat as high confidence
+                elif len(curr_words) <= 2 and len(curr_words) >= 1 and len(next_words) > len(curr_words):
+                    if curr_words == next_words[:len(curr_words)]:
+                        is_false_start = True
+                        ratio = max(ratio, high_threshold + 0.01)
+                elif len(curr_text) < len(next_text) * 0.6 and len(curr_words) <= 4:
+                    if curr_words and next_words and curr_words == next_words[:len(curr_words)]:
+                        is_false_start = True
+                        ratio = max(ratio, high_threshold + 0.01)
+
+                if debug:
+                    print(f"Comparing Seg[{i}] vs Seg[{j}]:")
+                    print(f"  A: '{curr.text[:50]}{'...' if len(curr.text) > 50 else ''}'")
+                    print(f"  B: '{next_seg.text[:50]}{'...' if len(next_seg.text) > 50 else ''}'")
+                    print(f"  Normalized A: '{curr_text}'")
+                    print(f"  Normalized B: '{next_text}'")
+                    print(f"  -> Ratio: {ratio:.2%}" + (" (false start)" if is_false_start else ""))
+
+                # Determine which segment to delete (shorter/incomplete one)
+                # Usually the first one, but if second is shorter, delete that
+                if len(curr_text) <= len(next_text):
+                    recommended_delete = "a"  # Delete earlier/shorter
+                else:
+                    recommended_delete = "b"  # Delete later if it's shorter
+
+                # Tier 1: High confidence (>85%) - auto delete
+                if ratio > high_threshold:
+                    if debug:
+                        print(f"  -> TIER 1: Auto-delete (segment {recommended_delete.upper()})")
+                    processed_indices.add(i)
+
+                    # Delete the shorter/incomplete segment
+                    if recommended_delete == "a":
+                        auto_delete.append(DeletionRange(
+                            start=curr.start,
+                            end=curr.end,
+                            reason=f"Auto: {ratio:.0%} match - '{curr.text[:35]}...'"
+                        ))
+                    else:
+                        auto_delete.append(DeletionRange(
+                            start=next_seg.start,
+                            end=next_seg.end,
+                            reason=f"Auto: {ratio:.0%} match - '{next_seg.text[:35]}...'"
+                        ))
+                        processed_indices.add(j)
+                    break
+
+                # Tier 2: Uncertain (70-85%) - needs review
+                elif ratio >= low_threshold:
+                    if debug:
+                        print(f"  -> TIER 2: Needs review")
+                    processed_indices.add(i)
+                    needs_review.append(RepetitionCandidate(
+                        segment_a=curr,
+                        segment_b=next_seg,
+                        similarity=ratio,
+                        normalized_a=curr_text,
+                        normalized_b=next_text,
+                        recommended_delete=recommended_delete
+                    ))
+                    break
+
+                # Tier 3: Different (<70%) - keep both
+                else:
+                    if debug:
+                        print(f"  -> TIER 3: Keep both")
+
+                if debug:
+                    print()
+
+        if debug:
+            print(f"{'='*60}")
+            print(f"ANALYSIS COMPLETE")
+            print(f"  Auto-delete (Tier 1): {len(auto_delete)} segments")
+            print(f"  Needs review (Tier 2): {len(needs_review)} pairs")
+            print(f"{'='*60}\n")
+
+        return RepetitionAnalysis(
+            auto_delete=auto_delete,
+            needs_review=needs_review,
+            segments=segments
+        )
+
     def _detect_repetitions(
         self,
         segments: list[Segment],
@@ -270,118 +555,21 @@ class AudioProcessor:
         debug: bool = True
     ) -> list[DeletionRange]:
         """
-        Detect repetitions using "The Last Take Strategy" with sliding window.
-
-        Conditions for deletion:
-        1. Fuzzy match: SequenceMatcher ratio > threshold
-        2. False start: Segment[i] is substring of start of Segment[i+k]
-        3. Word-level stutter: Short segment (1-2 words) contained in start of later segment
-
-        Uses a lookahead window to catch repetitions separated by silence segments.
-        The FIRST segment is marked for deletion (keep the last take).
-
-        Args:
-            segments: List of transcribed segments.
-            similarity_threshold: Minimum ratio for fuzzy match (default 0.85).
-            lookahead_window: How many segments ahead to compare (default 3).
-            debug: Print comparison details for debugging.
+        Legacy method - detects repetitions and returns deletions directly.
+        Use analyze_repetitions() for interactive workflow.
         """
-        if len(segments) < 2:
-            return []
-
-        deletions = []
-        deleted_indices = set()  # Track already-deleted segments to avoid duplicates
-
-        if debug:
-            print(f"\n{'='*60}")
-            print("REPETITION DETECTION DEBUG")
-            print(f"{'='*60}")
-            print(f"Total segments: {len(segments)}")
-            print(f"Similarity threshold: {similarity_threshold}")
-            print(f"Lookahead window: {lookahead_window}")
-            print(f"{'='*60}\n")
-
-        for i in range(len(segments)):
-            if i in deleted_indices:
-                continue
-
-            curr = segments[i]
-            curr_text = self._normalize_text(curr.text)
-            curr_words = curr_text.split()
-
-            # Compare with next N segments (sliding window)
-            for offset in range(1, lookahead_window + 1):
-                j = i + offset
-                if j >= len(segments):
-                    break
-                if j in deleted_indices:
-                    continue
-
-                next_seg = segments[j]
-                next_text = self._normalize_text(next_seg.text)
-                next_words = next_text.split()
-
-                should_delete = False
-                reason = ""
-
-                # Condition 1: Fuzzy match (repetition)
-                ratio = SequenceMatcher(None, curr_text, next_text).ratio()
-
-                if debug:
-                    print(f"Comparing Seg[{i}] vs Seg[{j}]:")
-                    print(f"  '{curr.text[:50]}{'...' if len(curr.text) > 50 else ''}'")
-                    print(f"  '{next_seg.text[:50]}{'...' if len(next_seg.text) > 50 else ''}'")
-                    print(f"  Normalized: '{curr_text}' vs '{next_text}'")
-                    print(f"  -> Ratio: {ratio:.2%}")
-
-                if ratio > similarity_threshold:
-                    should_delete = True
-                    reason = f"Repetition ({ratio:.0%} match): '{curr.text[:40]}...'"
-                    if debug:
-                        print(f"  -> MATCH: Fuzzy repetition detected!")
-
-                # Condition 2: False start (current text is prefix of next)
-                elif len(curr_text) > 3 and next_text.startswith(curr_text):
-                    should_delete = True
-                    reason = f"False start: '{curr.text[:30]}...'"
-                    if debug:
-                        print(f"  -> MATCH: False start detected!")
-
-                # Condition 3: Word-level stutter (1-2 word segment at start of next)
-                elif len(curr_words) <= 2 and len(curr_words) >= 1 and len(next_words) > len(curr_words):
-                    if curr_words == next_words[:len(curr_words)]:
-                        should_delete = True
-                        reason = f"Word stutter: '{curr.text}' -> '{next_seg.text[:30]}...'"
-                        if debug:
-                            print(f"  -> MATCH: Word-level stutter detected!")
-
-                # Condition 4: Partial phrase match (current is short and matches start of next)
-                elif len(curr_text) < len(next_text) * 0.6 and len(curr_words) <= 4:
-                    if curr_words and next_words and curr_words == next_words[:len(curr_words)]:
-                        should_delete = True
-                        reason = f"Incomplete phrase: '{curr.text[:30]}...'"
-                        if debug:
-                            print(f"  -> MATCH: Incomplete phrase detected!")
-
-                if debug and not should_delete:
-                    print(f"  -> No match")
-                if debug:
-                    print()
-
-                if should_delete:
-                    deleted_indices.add(i)
-                    deletions.append(DeletionRange(
-                        start=curr.start,
-                        end=curr.end,
-                        reason=reason
-                    ))
-                    break  # Stop checking further segments for this one
-
-        if debug:
-            print(f"{'='*60}")
-            print(f"Total deletions: {len(deletions)}")
-            print(f"{'='*60}\n")
-
+        analysis = self.analyze_repetitions(
+            segments,
+            high_threshold=similarity_threshold,
+            low_threshold=0.70,
+            lookahead_window=lookahead_window,
+            debug=debug
+        )
+        # In legacy mode, auto-delete everything above the threshold
+        # and also auto-confirm all review candidates
+        deletions = list(analysis.auto_delete)
+        for candidate in analysis.needs_review:
+            deletions.append(candidate.get_deletion_for(candidate.recommended_delete))
         return deletions
 
     def _remove_segments(
