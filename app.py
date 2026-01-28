@@ -11,8 +11,8 @@ from processor import AudioProcessor
 
 @st.cache_resource
 def load_whisper_model():
-    """Load and cache the Whisper model."""
-    return WhisperModel("base", device="cpu", compute_type="int8")
+    """Load and cache the Whisper model (large-v3 for Arabic accuracy)."""
+    return WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 
 def main():
@@ -30,6 +30,14 @@ def main():
     # Sidebar Controls
     with st.sidebar:
         st.header("Processing Options")
+
+        language = st.selectbox(
+            "Audio Language",
+            options=["ar", "en", "auto"],
+            index=0,
+            format_func=lambda x: {"ar": "Arabic (العربية)", "en": "English", "auto": "Auto-detect"}[x],
+            help="Select the language of your audio. Arabic is optimized for best results."
+        )
 
         remove_noise = st.checkbox(
             "Remove Noise",
@@ -57,6 +65,8 @@ def main():
             "Silences longer than 800ms will be truncated to 100ms "
             "to maintain natural pacing."
         )
+        if language == "ar":
+            st.caption("🇸🇦 Arabic text normalization is enabled (diacritics, Alef variants, etc.)")
 
     # File Uploader
     uploaded_file = st.file_uploader(
@@ -115,6 +125,7 @@ def main():
                             remove_noise=remove_noise,
                             remove_repetitions=remove_repetitions,
                             silence_threshold_db=float(silence_threshold),
+                            language=language if language != "auto" else None,
                             progress_callback=update_progress,
                         )
 

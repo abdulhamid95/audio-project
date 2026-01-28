@@ -1,6 +1,8 @@
 """Core audio processing logic - The Brain."""
 
 import os
+import re
+import string
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable
@@ -60,6 +62,7 @@ class AudioProcessor:
         remove_noise: bool = True,
         remove_repetitions: bool = True,
         silence_threshold_db: float = -40.0,
+        language: str | None = "ar",
         progress_callback: Callable[[float], None] | None = None,
     ) -> str:
         """
@@ -71,6 +74,7 @@ class AudioProcessor:
             remove_noise: Whether to apply noise reduction.
             remove_repetitions: Whether to detect and remove repetitions.
             silence_threshold_db: Threshold for silence detection.
+            language: Language code for transcription (default "ar" for Arabic).
             progress_callback: Function(progress: float) for updates.
 
         Returns:
@@ -90,9 +94,10 @@ class AudioProcessor:
 
         # Step B: Repetition Removal (30-70%)
         if remove_repetitions:
-            self.log("Transcribing audio with Whisper AI...")
+            lang_str = language if language else "auto-detect"
+            self.log(f"Transcribing audio with Whisper AI (language: {lang_str})...")
             update(0.35)
-            segments = self._transcribe(current_path)
+            segments = self._transcribe(current_path, language=language)
             self.log(f"Found {len(segments)} speech segments.")
             update(0.5)
 
@@ -169,13 +174,22 @@ class AudioProcessor:
 
         return output_path
 
-    def _transcribe(self, audio_path: str) -> list[Segment]:
-        """Transcribe audio using Whisper."""
-        segments_gen, _ = self.model.transcribe(
-            audio_path,
-            word_timestamps=True,
-            vad_filter=True,
-        )
+    def _transcribe(self, audio_path: str, language: str | None = "ar") -> list[Segment]:
+        """Transcribe audio using Whisper.
+
+        Args:
+            audio_path: Path to audio file.
+            language: Language code (default "ar" for Arabic), None for auto-detect.
+        """
+        transcribe_kwargs = {
+            "word_timestamps": True,
+            "vad_filter": True,
+        }
+        if language:
+            transcribe_kwargs["language"] = language
+
+        segments_gen, info = self.model.transcribe(audio_path, **transcribe_kwargs)
+        self.log(f"Detected language: {info.language} (probability: {info.language_probability:.0%})")
 
         segments = []
         for seg in segments_gen:
@@ -187,62 +201,186 @@ class AudioProcessor:
 
         return segments
 
+    def _normalize_text(self, text: str) -> str:
+        """
+        Normalize text for comparison, optimized for Arabic language.
+
+        Arabic-specific normalization:
+        - Remove Arabic diacritics (Tashkeel/Harakat)
+        - Normalize Alef variants (أ, إ, آ → ا)
+        - Normalize Teh Marbuta (ة → ه)
+        - Remove common prefixes (و, ف) from word beginnings
+
+        Also handles English:
+        - Remove punctuation
+        - Lowercase
+        """
+        # Remove Arabic diacritics (Tashkeel/Harakat)
+        # Range: \u064B-\u065F (Fathatan to Waslah)
+        # Also: \u0670 (Superscript Alef), \u06D6-\u06DC (Quranic marks)
+        arabic_diacritics = re.compile(r'[\u064B-\u065F\u0670\u06D6-\u06DC]')
+        text = arabic_diacritics.sub('', text)
+
+        # Normalize Alef variants (أ إ آ ٱ → ا)
+        text = re.sub(r'[أإآٱ]', 'ا', text)
+
+        # Normalize Teh Marbuta (ة → ه)
+        text = text.replace('ة', 'ه')
+
+        # Normalize Alef Maksura (ى → ي)
+        text = text.replace('ى', 'ي')
+
+        # Remove all punctuation (English and Arabic)
+        # Arabic punctuation: ، ؛ ؟ etc.
+        arabic_punctuation = '،؛؟«»ـ'
+        all_punctuation = string.punctuation + arabic_punctuation
+        text = text.translate(str.maketrans("", "", all_punctuation))
+
+        # Lowercase (for any English mixed in)
+        text = text.lower().strip()
+
+        # Collapse multiple spaces into one
+        text = re.sub(r'\s+', ' ', text)
+
+        # Strip common Arabic prefixes from words (و, ف, ال, ب, ك, ل)
+        # These are often attached and can cause matching issues
+        words = text.split()
+        normalized_words = []
+        for word in words:
+            # Strip single-letter prefixes و (and), ف (so/then)
+            if len(word) > 2 and word[0] in 'وف':
+                word = word[1:]
+            # Strip بال، كال، فال، وال (common prefix combinations with ال)
+            if len(word) > 3 and word[:3] in ['بال', 'كال', 'فال', 'وال']:
+                word = word[3:]
+            # Strip ال (the) - definite article
+            elif len(word) > 2 and word[:2] == 'ال':
+                word = word[2:]
+            normalized_words.append(word)
+
+        text = ' '.join(normalized_words)
+
+        return text
+
     def _detect_repetitions(
         self,
         segments: list[Segment],
-        similarity_threshold: float = 0.85
+        similarity_threshold: float = 0.80,
+        lookahead_window: int = 3,
+        debug: bool = True
     ) -> list[DeletionRange]:
         """
-        Detect repetitions using "The Last Take Strategy".
+        Detect repetitions using "The Last Take Strategy" with sliding window.
 
         Conditions for deletion:
-        1. Fuzzy match: SequenceMatcher ratio > 0.85
-        2. False start: Segment[i] is substring of start of Segment[i+1]
+        1. Fuzzy match: SequenceMatcher ratio > threshold
+        2. False start: Segment[i] is substring of start of Segment[i+k]
+        3. Word-level stutter: Short segment (1-2 words) contained in start of later segment
 
+        Uses a lookahead window to catch repetitions separated by silence segments.
         The FIRST segment is marked for deletion (keep the last take).
+
+        Args:
+            segments: List of transcribed segments.
+            similarity_threshold: Minimum ratio for fuzzy match (default 0.85).
+            lookahead_window: How many segments ahead to compare (default 3).
+            debug: Print comparison details for debugging.
         """
         if len(segments) < 2:
             return []
 
         deletions = []
+        deleted_indices = set()  # Track already-deleted segments to avoid duplicates
 
-        for i in range(len(segments) - 1):
+        if debug:
+            print(f"\n{'='*60}")
+            print("REPETITION DETECTION DEBUG")
+            print(f"{'='*60}")
+            print(f"Total segments: {len(segments)}")
+            print(f"Similarity threshold: {similarity_threshold}")
+            print(f"Lookahead window: {lookahead_window}")
+            print(f"{'='*60}\n")
+
+        for i in range(len(segments)):
+            if i in deleted_indices:
+                continue
+
             curr = segments[i]
-            next_seg = segments[i + 1]
+            curr_text = self._normalize_text(curr.text)
+            curr_words = curr_text.split()
 
-            curr_text = curr.text.lower().strip()
-            next_text = next_seg.text.lower().strip()
+            # Compare with next N segments (sliding window)
+            for offset in range(1, lookahead_window + 1):
+                j = i + offset
+                if j >= len(segments):
+                    break
+                if j in deleted_indices:
+                    continue
 
-            should_delete = False
-            reason = ""
-
-            # Condition 1: Fuzzy match (repetition)
-            ratio = SequenceMatcher(None, curr_text, next_text).ratio()
-            if ratio > similarity_threshold:
-                should_delete = True
-                reason = f"Repetition ({ratio:.0%} similar): '{curr.text[:40]}...' -> Removed"
-
-            # Condition 2: False start (substring at beginning)
-            elif len(curr_text) > 3 and next_text.startswith(curr_text[:len(curr_text)]):
-                should_delete = True
-                reason = f"False start: '{curr.text[:30]}...' -> Removed"
-
-            # Also check if current is a short prefix of next (common stutter pattern)
-            elif len(curr_text) < len(next_text) * 0.5:
-                # Check if current text words appear at start of next
-                curr_words = curr_text.split()
+                next_seg = segments[j]
+                next_text = self._normalize_text(next_seg.text)
                 next_words = next_text.split()
-                if len(curr_words) >= 1 and len(next_words) >= len(curr_words):
+
+                should_delete = False
+                reason = ""
+
+                # Condition 1: Fuzzy match (repetition)
+                ratio = SequenceMatcher(None, curr_text, next_text).ratio()
+
+                if debug:
+                    print(f"Comparing Seg[{i}] vs Seg[{j}]:")
+                    print(f"  '{curr.text[:50]}{'...' if len(curr.text) > 50 else ''}'")
+                    print(f"  '{next_seg.text[:50]}{'...' if len(next_seg.text) > 50 else ''}'")
+                    print(f"  Normalized: '{curr_text}' vs '{next_text}'")
+                    print(f"  -> Ratio: {ratio:.2%}")
+
+                if ratio > similarity_threshold:
+                    should_delete = True
+                    reason = f"Repetition ({ratio:.0%} match): '{curr.text[:40]}...'"
+                    if debug:
+                        print(f"  -> MATCH: Fuzzy repetition detected!")
+
+                # Condition 2: False start (current text is prefix of next)
+                elif len(curr_text) > 3 and next_text.startswith(curr_text):
+                    should_delete = True
+                    reason = f"False start: '{curr.text[:30]}...'"
+                    if debug:
+                        print(f"  -> MATCH: False start detected!")
+
+                # Condition 3: Word-level stutter (1-2 word segment at start of next)
+                elif len(curr_words) <= 2 and len(curr_words) >= 1 and len(next_words) > len(curr_words):
                     if curr_words == next_words[:len(curr_words)]:
                         should_delete = True
-                        reason = f"Incomplete phrase: '{curr.text[:30]}...' -> Removed"
+                        reason = f"Word stutter: '{curr.text}' -> '{next_seg.text[:30]}...'"
+                        if debug:
+                            print(f"  -> MATCH: Word-level stutter detected!")
 
-            if should_delete:
-                deletions.append(DeletionRange(
-                    start=curr.start,
-                    end=curr.end,
-                    reason=reason
-                ))
+                # Condition 4: Partial phrase match (current is short and matches start of next)
+                elif len(curr_text) < len(next_text) * 0.6 and len(curr_words) <= 4:
+                    if curr_words and next_words and curr_words == next_words[:len(curr_words)]:
+                        should_delete = True
+                        reason = f"Incomplete phrase: '{curr.text[:30]}...'"
+                        if debug:
+                            print(f"  -> MATCH: Incomplete phrase detected!")
+
+                if debug and not should_delete:
+                    print(f"  -> No match")
+                if debug:
+                    print()
+
+                if should_delete:
+                    deleted_indices.add(i)
+                    deletions.append(DeletionRange(
+                        start=curr.start,
+                        end=curr.end,
+                        reason=reason
+                    ))
+                    break  # Stop checking further segments for this one
+
+        if debug:
+            print(f"{'='*60}")
+            print(f"Total deletions: {len(deletions)}")
+            print(f"{'='*60}\n")
 
         return deletions
 
