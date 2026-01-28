@@ -1,0 +1,33 @@
+# Project: Python AI Audio Editor for Tutorials
+
+## Context
+I am a developer looking to build a pure **Python** automation tool to clean up my tutorial recordings. I have a C++ background, but I want this project to be 100% Python for ease of use and library support.
+
+## The Workflow
+I need a Python script that automates the following pipeline:
+
+### 1. Input Handling (.aup3)
+* My raw recordings are in **Audacity Project Format (`.aup3`)**.
+* **Challenge:** Since `.aup3` is an SQLite database, I need the script to handle this.
+* **Requirement:** If there is a Python library to read this directly, use it. If not, write a function that uses `ffmpeg` (via `subprocess`) to convert the input to a high-quality `.wav` file first before processing.
+
+### 2. Audio Cleaning (Denoise)
+* Apply a noise reduction filter to remove background static/hiss.
+* Library suggestion: `noisereduce` or similar.
+
+### 3. Smart Repetition Removal (Crucial Feature)
+* **Problem:** During recording, I often repeat a sentence 2 or 3 times to get it right.
+* **Solution:**
+    1.  Use **Whisper (faster-whisper)** to transcribe the audio with precise timestamps.
+    2.  Analyze the text segments.
+    3.  **Logic:** If two or more consecutive segments are phonetically or textually similar (fuzzy matching), **keep ONLY the last iteration** and cut the previous ones out. The assumption is that the last attempt is always the correct one.
+
+### 4. Silence Removal
+* After handling the repetitions, trim long silences (e.g., > 800ms) to make the pacing faster.
+
+## Deliverables
+1.  A complete, modular Python script (`main.py`).
+2.  A `requirements.txt` file.
+3.  Explanation of the "Repetition Logic" used (how you determine similarity).
+
+**Tech Stack:** Python 3.x, `pydub`, `faster-whisper`, `noisereduce`, `scipy`.
