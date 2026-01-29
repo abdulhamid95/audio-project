@@ -9,7 +9,16 @@ from faster_whisper import WhisperModel
 from pydub import AudioSegment
 
 from utils import convert_input
-from processor import AudioProcessor, RepetitionAnalysis, DeletionRange
+from processor import (
+    AudioProcessor,
+    RepetitionAnalysis,
+    DeletionRange,
+    VideoSegment,
+    check_ffmpeg,
+    create_timestamps_map,
+    process_video_ffmpeg,
+    get_video_duration,
+)
 
 
 def extract_audio_segment(audio_path: str, start: float, end: float) -> bytes:
@@ -47,6 +56,15 @@ def init_session_state():
         st.session_state.final_audio = None
     if "output_filename" not in st.session_state:
         st.session_state.output_filename = None
+    # Video processing state
+    if "video_path" not in st.session_state:
+        st.session_state.video_path = None
+    if "final_video" not in st.session_state:
+        st.session_state.final_video = None
+    if "video_output_filename" not in st.session_state:
+        st.session_state.video_output_filename = None
+    if "all_deletions" not in st.session_state:
+        st.session_state.all_deletions = []
 
 
 def reset_state():
@@ -60,6 +78,11 @@ def reset_state():
     st.session_state.review_decisions = {}
     st.session_state.final_audio = None
     st.session_state.output_filename = None
+    # Video state
+    st.session_state.video_path = None
+    st.session_state.final_video = None
+    st.session_state.video_output_filename = None
+    st.session_state.all_deletions = []
 
 
 def render_upload_phase():
@@ -320,6 +343,9 @@ def process_final_audio():
             all_deletions.append(candidate.get_deletion_for("b"))
         # "keep_both" = no deletion
 
+    # Save deletions for video processing
+    st.session_state.all_deletions = all_deletions
+
     # Load model
     with st.spinner("Finalizing audio..."):
         model = load_whisper_model()
@@ -367,10 +393,11 @@ def process_final_audio():
 
 
 def render_complete_phase():
-    """Render the completion phase with download."""
+    """Render the completion phase with download and video processing."""
     st.success("Audio processing complete!")
 
-    st.subheader("Final Result")
+    # Audio Result Section
+    st.subheader("🎵 Final Audio")
     st.audio(st.session_state.final_audio, format="audio/wav")
 
     col1, col2 = st.columns(2)
@@ -389,6 +416,146 @@ def render_complete_phase():
         if st.button("Process Another File", use_container_width=True):
             reset_state()
             st.rerun()
+
+    # Video Processing Section
+    st.markdown("---")
+    st.subheader("🎬 Video Processing (Optional)")
+
+    # Check FFmpeg availability
+    ffmpeg_available = check_ffmpeg()
+
+    if not ffmpeg_available:
+        st.warning("FFmpeg not found. Install FFmpeg to enable video processing with speed ramping.")
+    else:
+        st.info(
+            "Upload a screen recording to sync with the edited audio. "
+            "Sections where audio was removed will play at **10x speed** instead of being cut."
+        )
+
+        # Show final video if already processed
+        if st.session_state.final_video:
+            st.success("Video processing complete!")
+            st.video(st.session_state.final_video)
+
+            st.download_button(
+                label="Download Processed Video (MP4)",
+                data=st.session_state.final_video,
+                file_name=st.session_state.video_output_filename,
+                mime="video/mp4",
+                type="primary",
+                use_container_width=True,
+            )
+        else:
+            # Video upload
+            video_file = st.file_uploader(
+                "Upload Video File",
+                type=["mp4", "mov", "avi", "mkv", "webm"],
+                help="Upload the screen recording that corresponds to this audio."
+            )
+
+            if video_file is not None:
+                st.video(video_file)
+                st.caption(f"**{video_file.name}** ({video_file.size / (1024*1024):.1f} MB)")
+
+                # Video processing options
+                col_preset, col_bitrate = st.columns(2)
+                with col_preset:
+                    preset = st.selectbox(
+                        "Encoding Speed",
+                        options=["ultrafast", "fast", "medium", "slow"],
+                        index=1,
+                        help="Faster = larger file, slower = better compression"
+                    )
+                with col_bitrate:
+                    bitrate = st.selectbox(
+                        "Video Quality",
+                        options=["3000k", "5000k", "8000k", "10000k"],
+                        index=1,
+                        help="Higher = better quality, larger file"
+                    )
+
+                speedup = st.slider(
+                    "Speed-up Factor",
+                    min_value=2,
+                    max_value=20,
+                    value=10,
+                    help="How fast to play removed sections (10x = 10 seconds becomes 1 second)"
+                )
+
+                if st.button("Process Video", type="primary", use_container_width=True):
+                    process_video(video_file, preset, bitrate, speedup)
+
+
+def process_video(video_file, preset: str, bitrate: str, speedup: int):
+    """Process video with speed ramping based on audio deletions."""
+    temp_dir = st.session_state.temp_dir
+
+    with st.status("Processing video...", expanded=True) as status:
+        log_container = st.container()
+
+        def log_message(msg: str):
+            with log_container:
+                st.write(msg)
+
+        try:
+            # Save uploaded video
+            log_message("Saving video file...")
+            video_input_path = os.path.join(temp_dir, video_file.name)
+            with open(video_input_path, "wb") as f:
+                f.write(video_file.getbuffer())
+
+            # Get video duration
+            log_message("Analyzing video...")
+            video_duration = get_video_duration(video_input_path)
+            if video_duration <= 0:
+                raise RuntimeError("Could not determine video duration.")
+            log_message(f"Video duration: {video_duration:.1f} seconds")
+
+            # Create timestamps map from deletions
+            log_message("Building segment map...")
+            deletions = st.session_state.all_deletions
+            timestamps_map = create_timestamps_map(deletions, video_duration)
+
+            normal_count = sum(1 for s in timestamps_map if s.speed == "normal")
+            speedup_count = sum(1 for s in timestamps_map if s.speed == "speedup")
+            log_message(f"  Normal segments: {normal_count}")
+            log_message(f"  Speed-up segments: {speedup_count} (will play at {speedup}x)")
+
+            # Save processed audio to file for FFmpeg
+            audio_path = os.path.join(temp_dir, "final_audio.wav")
+            with open(audio_path, "wb") as f:
+                f.write(st.session_state.final_audio)
+
+            # Output path
+            output_filename = f"{os.path.splitext(video_file.name)[0]}_edited.mp4"
+            output_path = os.path.join(temp_dir, output_filename)
+
+            # Process video
+            log_message("Starting FFmpeg encoding (this may take a while)...")
+            process_video_ffmpeg(
+                video_input=video_input_path,
+                audio_input=audio_path,
+                output_path=output_path,
+                timestamps_map=timestamps_map,
+                speedup_factor=float(speedup),
+                video_bitrate=bitrate,
+                preset=preset,
+                log_callback=log_message
+            )
+
+            # Read output video
+            with open(output_path, "rb") as f:
+                st.session_state.final_video = f.read()
+            st.session_state.video_output_filename = output_filename
+
+            status.update(label="Video processing complete!", state="complete")
+
+        except Exception as e:
+            status.update(label="Video processing failed", state="error")
+            st.error(str(e))
+            return
+
+    st.rerun()
 
 
 def main():
