@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from faster_whisper import WhisperModel
-import torch
 
 
 def detect_device() -> tuple[str, str]:
@@ -12,10 +11,13 @@ def detect_device() -> tuple[str, str]:
     Returns:
         Tuple of (device, compute_type) for WhisperModel initialization.
     """
-    if torch.cuda.is_available():
-        return "cuda", "float16"
-    else:
-        return "cpu", "int8"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda", "float16"
+    except ImportError:
+        pass
+    return "cpu", "int8"
 
 
 @dataclass
