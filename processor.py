@@ -387,7 +387,31 @@ class AudioProcessor:
 
         return segments
 
-    def _normalize_text(self, text: str) -> str:
+    def _phonetic_normalize(self, text: str) -> str:
+        """
+        Apply phonetic normalization for similar-sounding Arabic letters.
+
+        This is used for similarity comparison ONLY, not for display.
+        Handles common transcription confusions:
+        - ذ, ظ → ز (all become 'z' sound)
+        - ث, ص → س (sibilants normalized)
+        - ة → ه (teh marbuta)
+        - أ, إ, آ, ا → ا (alef variants)
+        - ض → د (dad/dal confusion)
+        - ق → ك (qaf/kaf in some dialects)
+        """
+        # Normalize emphatic/similar consonants
+        text = text.replace('ذ', 'ز')
+        text = text.replace('ظ', 'ز')
+        text = text.replace('ث', 'س')
+        text = text.replace('ص', 'س')
+        text = text.replace('ض', 'د')
+        # Note: ق→ك is dialect-specific, uncomment if needed:
+        # text = text.replace('ق', 'ك')
+
+        return text
+
+    def _normalize_text(self, text: str, phonetic: bool = True) -> str:
         """
         Normalize text for comparison, optimized for Arabic language.
 
@@ -396,10 +420,15 @@ class AudioProcessor:
         - Normalize Alef variants (أ, إ, آ → ا)
         - Normalize Teh Marbuta (ة → ه)
         - Remove common prefixes (و, ف) from word beginnings
+        - Optionally apply phonetic normalization for similar-sounding letters
 
         Also handles English:
         - Remove punctuation
         - Lowercase
+
+        Args:
+            text: The text to normalize.
+            phonetic: If True, apply phonetic normalization for fuzzy matching.
         """
         # Remove Arabic diacritics (Tashkeel/Harakat)
         # Range: \u064B-\u065F (Fathatan to Waslah)
@@ -415,6 +444,10 @@ class AudioProcessor:
 
         # Normalize Alef Maksura (ى → ي)
         text = text.replace('ى', 'ي')
+
+        # Apply phonetic normalization for similar-sounding letters
+        if phonetic:
+            text = self._phonetic_normalize(text)
 
         # Remove all punctuation (English and Arabic)
         # Arabic punctuation: ، ؛ ؟ etc.
@@ -447,6 +480,53 @@ class AudioProcessor:
         text = ' '.join(normalized_words)
 
         return text
+
+    def _is_prefix_of(self, shorter: str, longer: str, min_ratio: float = 0.4) -> bool:
+        """
+        Check if 'shorter' is a prefix/subsegment of 'longer'.
+
+        Used to detect "false starts" where speaker began a sentence,
+        stopped, and restarted with the complete version.
+
+        Args:
+            shorter: The potentially incomplete segment (normalized).
+            longer: The potentially complete segment (normalized).
+            min_ratio: Minimum ratio of shorter to longer length to consider.
+
+        Returns:
+            True if shorter appears to be a false start of longer.
+        """
+        if not shorter or not longer:
+            return False
+
+        # shorter must be significantly shorter than longer
+        if len(shorter) >= len(longer) * 0.9:
+            return False
+
+        # shorter must be at least min_ratio of longer (not too short)
+        if len(shorter) < len(longer) * min_ratio:
+            return False
+
+        # Check if shorter is a prefix of longer
+        if longer.startswith(shorter):
+            return True
+
+        # Check word-level prefix match
+        shorter_words = shorter.split()
+        longer_words = longer.split()
+
+        if len(shorter_words) >= 1 and len(longer_words) > len(shorter_words):
+            # Check if first N words match
+            if shorter_words == longer_words[:len(shorter_words)]:
+                return True
+
+            # Fuzzy word-level prefix: allow 1 word difference
+            if len(shorter_words) >= 2:
+                matches = sum(1 for a, b in zip(shorter_words, longer_words) if a == b)
+                if matches >= len(shorter_words) - 1:
+                    return True
+
+        return False
 
     def analyze_repetitions(
         self,
@@ -501,7 +581,7 @@ class AudioProcessor:
                 continue
 
             curr = segments[i]
-            curr_text = self._normalize_text(curr.text)
+            curr_text = self._normalize_text(curr.text, phonetic=True)
             curr_words = curr_text.split()
 
             for offset in range(1, lookahead_window + 1):
@@ -512,25 +592,24 @@ class AudioProcessor:
                     continue
 
                 next_seg = segments[j]
-                next_text = self._normalize_text(next_seg.text)
+                next_text = self._normalize_text(next_seg.text, phonetic=True)
                 next_words = next_text.split()
 
-                # Calculate similarity
+                # Calculate similarity using phonetically normalized text
                 ratio = SequenceMatcher(None, curr_text, next_text).ratio()
 
-                # Check for false start / prefix match (boost ratio if detected)
+                # Check for false start / prefix match using dedicated method
                 is_false_start = False
-                if len(curr_text) > 3 and next_text.startswith(curr_text):
+
+                # Check if curr is a prefix/false-start of next
+                if self._is_prefix_of(curr_text, next_text):
                     is_false_start = True
-                    ratio = max(ratio, high_threshold + 0.01)  # Treat as high confidence
-                elif len(curr_words) <= 2 and len(curr_words) >= 1 and len(next_words) > len(curr_words):
-                    if curr_words == next_words[:len(curr_words)]:
-                        is_false_start = True
-                        ratio = max(ratio, high_threshold + 0.01)
-                elif len(curr_text) < len(next_text) * 0.6 and len(curr_words) <= 4:
-                    if curr_words and next_words and curr_words == next_words[:len(curr_words)]:
-                        is_false_start = True
-                        ratio = max(ratio, high_threshold + 0.01)
+                    ratio = max(ratio, high_threshold + 0.01)  # Auto-delete false starts
+
+                # Also check reverse: next might be prefix of curr (less common)
+                elif self._is_prefix_of(next_text, curr_text):
+                    is_false_start = True
+                    ratio = max(ratio, high_threshold + 0.01)
 
                 if debug:
                     print(f"Comparing Seg[{i}] vs Seg[{j}]:")
@@ -634,29 +713,87 @@ class AudioProcessor:
         self,
         input_path: str,
         output_path: str,
-        deletions: list[DeletionRange]
+        deletions: list[DeletionRange],
+        padding_ms: int = 150,
+        crossfade_ms: int = 50
     ) -> str:
-        """Remove marked segments from audio."""
+        """
+        Remove marked segments from audio with padding and crossfade.
+
+        Args:
+            input_path: Path to input audio file.
+            output_path: Path for output audio file.
+            deletions: List of time ranges to delete.
+            padding_ms: Buffer added to keep segments to prevent cutting words (default 150ms).
+            crossfade_ms: Crossfade duration for smooth transitions (default 50ms).
+
+        Returns:
+            Path to output file.
+        """
         audio = AudioSegment.from_wav(input_path)
+        audio_len_ms = len(audio)
 
         # Sort by start time
         sorted_dels = sorted(deletions, key=lambda x: x.start)
 
-        # Build output by keeping non-deleted parts
-        result = AudioSegment.empty()
+        # Merge overlapping deletions (accounting for padding)
+        merged_dels = []
+        for d in sorted_dels:
+            # Apply padding: shrink the deletion to preserve word boundaries
+            # We add padding to the KEEP regions, which means we cut LESS
+            padded_start = d.start + (padding_ms / 1000.0)
+            padded_end = d.end - (padding_ms / 1000.0)
+
+            # Ensure the deletion is still valid after padding
+            if padded_start >= padded_end:
+                # Deletion too small after padding, skip it
+                continue
+
+            if merged_dels and padded_start <= merged_dels[-1][1]:
+                # Overlaps with previous, extend it
+                merged_dels[-1] = (merged_dels[-1][0], max(merged_dels[-1][1], padded_end))
+            else:
+                merged_dels.append((padded_start, padded_end))
+
+        if not merged_dels:
+            # No deletions to apply
+            audio.export(output_path, format="wav")
+            return output_path
+
+        # Build output by keeping non-deleted parts with crossfade
+        segments_to_keep = []
         current_pos = 0.0
 
-        for d in sorted_dels:
-            # Keep audio before this deletion
-            if d.start > current_pos:
+        for del_start, del_end in merged_dels:
+            if del_start > current_pos:
                 start_ms = int(current_pos * 1000)
-                end_ms = int(d.start * 1000)
-                result += audio[start_ms:end_ms]
-            current_pos = max(current_pos, d.end)
+                end_ms = int(del_start * 1000)
+                # Clamp to audio bounds
+                start_ms = max(0, start_ms)
+                end_ms = min(audio_len_ms, end_ms)
+                if end_ms > start_ms:
+                    segments_to_keep.append(audio[start_ms:end_ms])
+            current_pos = max(current_pos, del_end)
 
         # Keep audio after last deletion
-        if current_pos * 1000 < len(audio):
-            result += audio[int(current_pos * 1000):]
+        if current_pos * 1000 < audio_len_ms:
+            start_ms = int(current_pos * 1000)
+            segments_to_keep.append(audio[start_ms:])
+
+        # Join segments with crossfade for smooth transitions
+        if not segments_to_keep:
+            # Everything was deleted, return silent audio
+            result = AudioSegment.silent(duration=100)
+        elif len(segments_to_keep) == 1:
+            result = segments_to_keep[0]
+        else:
+            result = segments_to_keep[0]
+            for seg in segments_to_keep[1:]:
+                # Apply crossfade if both segments are long enough
+                if len(result) >= crossfade_ms and len(seg) >= crossfade_ms:
+                    result = result.append(seg, crossfade=crossfade_ms)
+                else:
+                    result = result + seg
 
         result.export(output_path, format="wav")
         return output_path
