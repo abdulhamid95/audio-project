@@ -3,6 +3,8 @@
 import os
 import re
 import string
+import subprocess
+import shutil
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable
@@ -968,3 +970,252 @@ class AudioProcessor:
 
         result.export(output_path, format="wav")
         return output_path
+
+
+# =============================================================================
+# VIDEO PROCESSING WITH FFMPEG (Speed Ramping)
+# =============================================================================
+
+@dataclass
+class VideoSegment:
+    """A video segment with speed information."""
+    start: float      # Start time in seconds
+    end: float        # End time in seconds
+    speed: str        # "normal" (1x) or "speedup" (10x)
+
+
+def check_ffmpeg() -> bool:
+    """Check if FFmpeg is available in the system."""
+    return shutil.which("ffmpeg") is not None
+
+
+def create_timestamps_map(
+    deletions: list[DeletionRange],
+    total_duration: float
+) -> list[VideoSegment]:
+    """
+    Convert audio deletions to video segment map with speed info.
+
+    Sections where audio was removed become "speedup" (10x) in video.
+    Sections where audio was kept remain "normal" (1x) speed.
+
+    Args:
+        deletions: List of time ranges that were deleted from audio.
+        total_duration: Total duration of original video in seconds.
+
+    Returns:
+        List of VideoSegment objects with speed type.
+    """
+    if not deletions:
+        return [VideoSegment(start=0, end=total_duration, speed="normal")]
+
+    # Sort deletions by start time
+    sorted_dels = sorted(deletions, key=lambda x: x.start)
+
+    segments = []
+    current_pos = 0.0
+
+    for d in sorted_dels:
+        # Normal segment before this deletion
+        if d.start > current_pos:
+            segments.append(VideoSegment(
+                start=current_pos,
+                end=d.start,
+                speed="normal"
+            ))
+
+        # Speedup segment (the deleted audio section)
+        if d.end > d.start:
+            segments.append(VideoSegment(
+                start=d.start,
+                end=d.end,
+                speed="speedup"
+            ))
+
+        current_pos = max(current_pos, d.end)
+
+    # Final normal segment after last deletion
+    if current_pos < total_duration:
+        segments.append(VideoSegment(
+            start=current_pos,
+            end=total_duration,
+            speed="normal"
+        ))
+
+    return segments
+
+
+def build_ffmpeg_filter_complex(
+    segments: list[VideoSegment],
+    speedup_factor: float = 10.0
+) -> tuple[str, int]:
+    """
+    Build FFmpeg filter_complex string for speed ramping.
+
+    Args:
+        segments: List of VideoSegment objects.
+        speedup_factor: Speed multiplier for speedup segments (default 10x).
+
+    Returns:
+        Tuple of (filter_complex string, number of segments).
+    """
+    if not segments:
+        return "", 0
+
+    filter_parts = []
+    concat_inputs = []
+
+    for i, seg in enumerate(segments):
+        duration = seg.end - seg.start
+        if duration <= 0:
+            continue
+
+        # Trim the segment
+        trim_filter = f"[0:v]trim=start={seg.start}:end={seg.end},setpts=PTS-STARTPTS"
+
+        if seg.speed == "speedup":
+            # Speed up by factor (PTS * 1/factor)
+            pts_factor = 1.0 / speedup_factor
+            trim_filter += f",setpts={pts_factor}*PTS"
+
+        # Add scaling to 1080p with padding for aspect ratio
+        scale_filter = (
+            "scale=1920:1080:force_original_aspect_ratio=decrease,"
+            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+        )
+
+        filter_parts.append(f"{trim_filter},{scale_filter}[v{i}]")
+        concat_inputs.append(f"[v{i}]")
+
+    if not concat_inputs:
+        return "", 0
+
+    # Build concat filter
+    num_segments = len(concat_inputs)
+    concat_filter = f"{''.join(concat_inputs)}concat=n={num_segments}:v=1:a=0[outv]"
+
+    filter_complex = ";".join(filter_parts) + ";" + concat_filter
+
+    return filter_complex, num_segments
+
+
+def process_video_ffmpeg(
+    video_input: str,
+    audio_input: str,
+    output_path: str,
+    timestamps_map: list[VideoSegment],
+    speedup_factor: float = 10.0,
+    video_bitrate: str = "5000k",
+    preset: str = "fast",
+    log_callback: Callable[[str], None] | None = None
+) -> str:
+    """
+    Process video with FFmpeg: apply speed ramping and sync with edited audio.
+
+    Args:
+        video_input: Path to input video file.
+        audio_input: Path to processed audio file (WAV).
+        output_path: Path for output MP4 file.
+        timestamps_map: List of VideoSegment with speed info.
+        speedup_factor: Speed multiplier for speedup sections (default 10x).
+        video_bitrate: Target video bitrate (default "5000k").
+        preset: FFmpeg encoding preset (default "fast").
+        log_callback: Function to call with progress updates.
+
+    Returns:
+        Path to output video file.
+
+    Raises:
+        RuntimeError: If FFmpeg is not available or encoding fails.
+    """
+    log = log_callback or (lambda x: None)
+
+    # Check FFmpeg availability
+    if not check_ffmpeg():
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg to process video.")
+
+    log("Building FFmpeg filter complex...")
+
+    # Build the filter complex
+    filter_complex, num_segments = build_ffmpeg_filter_complex(
+        timestamps_map,
+        speedup_factor=speedup_factor
+    )
+
+    if not filter_complex:
+        raise RuntimeError("No valid segments to process.")
+
+    log(f"Processing {num_segments} video segments...")
+
+    # Build FFmpeg command
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",  # Overwrite output
+        "-i", video_input,  # Input video
+        "-i", audio_input,  # Input audio (processed)
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",   # Map processed video
+        "-map", "1:a",      # Map audio from second input
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-b:v", video_bitrate,
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",  # Web optimization
+        output_path
+    ]
+
+    log("Starting FFmpeg encoding...")
+    log(f"  Preset: {preset}, Bitrate: {video_bitrate}")
+
+    try:
+        # Run FFmpeg with progress capture
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+
+        # Capture output for logging
+        _, stderr = process.communicate()
+
+        if process.returncode != 0:
+            # Log the error
+            error_lines = stderr.strip().split('\n')[-10:]  # Last 10 lines
+            log(f"FFmpeg error: {' '.join(error_lines)}")
+            raise RuntimeError(f"FFmpeg encoding failed with code {process.returncode}")
+
+        log("Video encoding complete!")
+        return output_path
+
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg executable not found.")
+
+
+def get_video_duration(video_path: str) -> float:
+    """
+    Get video duration using FFprobe.
+
+    Args:
+        video_path: Path to video file.
+
+    Returns:
+        Duration in seconds.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        return 0.0
