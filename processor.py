@@ -126,7 +126,7 @@ class AudioProcessor:
         output_path: str,
         remove_noise: bool = True,
         remove_repetitions: bool = True,
-        silence_threshold_db: float = -40.0,
+        silence_threshold_db: float = -50.0,
         language: str | None = "ar",
         progress_callback: Callable[[float], None] | None = None,
     ) -> str:
@@ -212,7 +212,7 @@ class AudioProcessor:
         input_path: str,
         temp_dir: str,
         remove_noise: bool = True,
-        silence_threshold_db: float = -40.0,
+        silence_threshold_db: float = -50.0,
         language: str | None = "ar",
         progress_callback: Callable[[float], None] | None = None,
     ) -> tuple[str, RepetitionAnalysis | None]:
@@ -714,35 +714,55 @@ class AudioProcessor:
         input_path: str,
         output_path: str,
         deletions: list[DeletionRange],
-        padding_ms: int = 150,
-        crossfade_ms: int = 50
+        padding_start_ms: int = 300,
+        padding_end_ms: int = 400,
+        crossfade_ms: int = 100,
+        min_deletion_ms: int = 500
     ) -> str:
         """
-        Remove marked segments from audio with padding and crossfade.
+        Remove marked segments from audio with asymmetric padding and crossfade.
+
+        "Natural Breath" settings to prevent word clipping:
+        - Asymmetric padding preserves word boundaries
+        - Crossfade creates smooth, natural-sounding transitions
+        - Minimum deletion threshold prevents removing important fragments
 
         Args:
             input_path: Path to input audio file.
             output_path: Path for output audio file.
             deletions: List of time ranges to delete.
-            padding_ms: Buffer added to keep segments to prevent cutting words (default 150ms).
-            crossfade_ms: Crossfade duration for smooth transitions (default 50ms).
+            padding_start_ms: Buffer before deletion to preserve word endings (default 300ms).
+            padding_end_ms: Buffer after deletion to preserve word starts (default 400ms).
+            crossfade_ms: Crossfade duration for smooth transitions (default 100ms).
+            min_deletion_ms: Minimum segment duration to delete (default 500ms).
 
         Returns:
             Path to output file.
         """
         audio = AudioSegment.from_wav(input_path)
         audio_len_ms = len(audio)
+        audio_len_sec = audio_len_ms / 1000.0
 
         # Sort by start time
         sorted_dels = sorted(deletions, key=lambda x: x.start)
 
-        # Merge overlapping deletions (accounting for padding)
+        # Filter and pad deletions
         merged_dels = []
         for d in sorted_dels:
-            # Apply padding: shrink the deletion to preserve word boundaries
-            # We add padding to the KEEP regions, which means we cut LESS
-            padded_start = d.start + (padding_ms / 1000.0)
-            padded_end = d.end - (padding_ms / 1000.0)
+            # Skip segments shorter than minimum (preserve important fragments)
+            segment_duration_ms = (d.end - d.start) * 1000
+            if segment_duration_ms < min_deletion_ms:
+                continue
+
+            # Apply asymmetric padding: shrink the deletion to preserve word boundaries
+            # padding_start_ms: extra time BEFORE the cut (preserve ending of previous speech)
+            # padding_end_ms: extra time AFTER the cut (preserve beginning of next speech)
+            padded_start = d.start + (padding_start_ms / 1000.0)
+            padded_end = d.end - (padding_end_ms / 1000.0)
+
+            # Clamp to audio bounds
+            padded_start = max(0, padded_start)
+            padded_end = min(audio_len_sec, padded_end)
 
             # Ensure the deletion is still valid after padding
             if padded_start >= padded_end:
@@ -780,7 +800,7 @@ class AudioProcessor:
             start_ms = int(current_pos * 1000)
             segments_to_keep.append(audio[start_ms:])
 
-        # Join segments with crossfade for smooth transitions
+        # Join segments with crossfade for smooth "natural breath" transitions
         if not segments_to_keep:
             # Everything was deleted, return silent audio
             result = AudioSegment.silent(duration=100)
@@ -802,14 +822,17 @@ class AudioProcessor:
         self,
         input_path: str,
         output_path: str,
-        threshold_db: float = -40.0,
-        min_silence_ms: int = 800,
-        target_silence_ms: int = 100
+        threshold_db: float = -50.0,
+        min_silence_ms: int = 600,
+        target_silence_ms: int = 150
     ) -> str:
         """
         Detect silences > min_silence_ms and truncate to target_silence_ms.
 
-        This keeps pacing natural instead of completely removing silences.
+        "Natural Breath" settings:
+        - Lower threshold (-50dB) ensures quiet word endings aren't treated as silence
+        - Higher min_silence (600ms) preserves natural pauses between words
+        - Increased target silence (150ms) maintains natural speech rhythm
         """
         sample_rate, audio_data = wavfile.read(input_path)
 
