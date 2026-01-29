@@ -451,24 +451,24 @@ class AudioProcessor:
     def analyze_repetitions(
         self,
         segments: list[Segment],
-        high_threshold: float = 0.85,
-        low_threshold: float = 0.70,
-        lookahead_window: int = 3,
+        high_threshold: float = 0.75,
+        low_threshold: float = 0.50,
+        lookahead_window: int = 4,
         debug: bool = True
     ) -> RepetitionAnalysis:
         """
         Analyze repetitions using three-tier confidence system.
 
         Tiers:
-        - Tier 1 (>85%): High confidence - auto-delete the shorter/earlier segment
-        - Tier 2 (70-85%): Uncertain - needs user review
-        - Tier 3 (<70%): Different - keep both
+        - Tier 1 (>75%): High confidence - auto-delete the shorter/earlier segment
+        - Tier 2 (50-75%): Uncertain - needs user review
+        - Tier 3 (<50%): Different - keep both
 
         Args:
             segments: List of transcribed segments.
-            high_threshold: Threshold for auto-delete (default 0.85).
-            low_threshold: Threshold for review (default 0.70).
-            lookahead_window: How many segments ahead to compare (default 3).
+            high_threshold: Threshold for auto-delete (default 0.75).
+            low_threshold: Threshold for review (default 0.50).
+            lookahead_window: How many segments ahead to compare (default 4).
             debug: Print comparison details for debugging.
 
         Returns:
@@ -608,8 +608,8 @@ class AudioProcessor:
     def _detect_repetitions(
         self,
         segments: list[Segment],
-        similarity_threshold: float = 0.80,
-        lookahead_window: int = 3,
+        similarity_threshold: float = 0.75,
+        lookahead_window: int = 4,
         debug: bool = True
     ) -> list[DeletionRange]:
         """
@@ -619,7 +619,7 @@ class AudioProcessor:
         analysis = self.analyze_repetitions(
             segments,
             high_threshold=similarity_threshold,
-            low_threshold=0.70,
+            low_threshold=0.50,
             lookahead_window=lookahead_window,
             debug=debug
         )

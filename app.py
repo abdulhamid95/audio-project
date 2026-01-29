@@ -1,13 +1,28 @@
 """AI Audio Refiner - Streamlit Web Application with Interactive Review."""
 
+import io
 import os
 import tempfile
 import shutil
 import streamlit as st
 from faster_whisper import WhisperModel
+from pydub import AudioSegment
 
 from utils import convert_input
 from processor import AudioProcessor, RepetitionAnalysis, DeletionRange
+
+
+def extract_audio_segment(audio_path: str, start: float, end: float) -> bytes:
+    """Extract a segment from an audio file and return as bytes for playback."""
+    audio = AudioSegment.from_wav(audio_path)
+    start_ms = int(start * 1000)
+    end_ms = int(end * 1000)
+    segment = audio[start_ms:end_ms]
+
+    buffer = io.BytesIO()
+    segment.export(buffer, format="wav")
+    buffer.seek(0)
+    return buffer.read()
 
 
 @st.cache_resource
@@ -185,22 +200,22 @@ def render_review_phase():
     with col1:
         st.metric("Total Segments", len(analysis.segments))
     with col2:
-        st.metric("Auto-Remove", len(analysis.auto_delete), help="High confidence (>85%)")
+        st.metric("Auto-Remove", len(analysis.auto_delete), help="High confidence (>75%)")
     with col3:
-        st.metric("Needs Review", len(analysis.needs_review), help="Uncertain (70-85%)")
+        st.metric("Needs Review", len(analysis.needs_review), help="Uncertain (50-75%)")
 
     # Auto-delete section
     if analysis.auto_delete:
         with st.expander(f"Auto-Remove ({len(analysis.auto_delete)} segments)", expanded=False):
-            st.caption("These segments will be automatically removed (>85% similarity):")
+            st.caption("These segments will be automatically removed (>75% similarity):")
             for i, deletion in enumerate(analysis.auto_delete):
                 st.text(f"{i+1}. [{deletion.start:.1f}s - {deletion.end:.1f}s] {deletion.reason}")
 
     # Review section - THE MAIN INTERACTIVE PART
     if analysis.needs_review:
         st.markdown("---")
-        st.markdown("### Potential Repetitions Found")
-        st.caption("Review these uncertain matches (70-85% similarity). Select which segment to **keep**.")
+        st.markdown("### Review Potential Repetitions (50%-75% Match)")
+        st.caption("Review these uncertain matches. Select which segment to **keep** (longer/more complete is recommended).")
 
         for idx, candidate in enumerate(analysis.needs_review):
             with st.container():
@@ -212,12 +227,28 @@ def render_review_phase():
                     st.markdown("**Segment A** (earlier)")
                     st.text(f"[{candidate.segment_a.start:.1f}s - {candidate.segment_a.end:.1f}s]")
                     st.info(candidate.segment_a.text)
+                    # Play button for segment A
+                    if st.session_state.prepared_audio_path:
+                        audio_a = extract_audio_segment(
+                            st.session_state.prepared_audio_path,
+                            candidate.segment_a.start,
+                            candidate.segment_a.end
+                        )
+                        st.audio(audio_a, format="audio/wav")
                     st.caption(f"Normalized: _{candidate.normalized_a}_")
 
                 with col_b:
                     st.markdown("**Segment B** (later)")
                     st.text(f"[{candidate.segment_b.start:.1f}s - {candidate.segment_b.end:.1f}s]")
                     st.info(candidate.segment_b.text)
+                    # Play button for segment B
+                    if st.session_state.prepared_audio_path:
+                        audio_b = extract_audio_segment(
+                            st.session_state.prepared_audio_path,
+                            candidate.segment_b.start,
+                            candidate.segment_b.end
+                        )
+                        st.audio(audio_b, format="audio/wav")
                     st.caption(f"Normalized: _{candidate.normalized_b}_")
 
                 # Determine which is longer/more complete
