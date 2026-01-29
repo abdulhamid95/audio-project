@@ -714,27 +714,32 @@ class AudioProcessor:
         input_path: str,
         output_path: str,
         deletions: list[DeletionRange],
-        padding_start_ms: int = 300,
-        padding_end_ms: int = 400,
-        crossfade_ms: int = 100,
-        min_deletion_ms: int = 500
+        padding_start_ms: int = 200,
+        padding_end_ms: int = 300,
+        crossfade_ms: int = 30,
+        min_deletion_ms: int = 500,
+        min_gap_ms: int = 600,
+        long_gap_threshold_ms: int = 1000
     ) -> str:
         """
-        Remove marked segments from audio with asymmetric padding and crossfade.
+        Remove marked segments from audio with "Safe Merging" strategy.
 
-        "Natural Breath" settings to prevent word clipping:
-        - Asymmetric padding preserves word boundaries
-        - Crossfade creates smooth, natural-sounding transitions
-        - Minimum deletion threshold prevents removing important fragments
+        Features:
+        - No-collision rule: segments never overlap
+        - Dynamic gaps: maintains 1000ms for long gaps, 600ms minimum for short gaps
+        - Safe padding with midpoint calculation to prevent overlaps
+        - Reduced crossfade (30ms) to prevent double-voice effect
 
         Args:
             input_path: Path to input audio file.
             output_path: Path for output audio file.
             deletions: List of time ranges to delete.
-            padding_start_ms: Buffer before deletion to preserve word endings (default 300ms).
-            padding_end_ms: Buffer after deletion to preserve word starts (default 400ms).
-            crossfade_ms: Crossfade duration for smooth transitions (default 100ms).
+            padding_start_ms: Buffer before deletion (default 200ms).
+            padding_end_ms: Buffer after deletion (default 300ms).
+            crossfade_ms: Crossfade duration (default 30ms, reduced to prevent overlaps).
             min_deletion_ms: Minimum segment duration to delete (default 500ms).
+            min_gap_ms: Minimum gap between segments (default 600ms).
+            long_gap_threshold_ms: Gaps longer than this are normalized to this (default 1000ms).
 
         Returns:
             Path to output file.
@@ -746,74 +751,130 @@ class AudioProcessor:
         # Sort by start time
         sorted_dels = sorted(deletions, key=lambda x: x.start)
 
-        # Filter and pad deletions
-        merged_dels = []
+        # Filter deletions by minimum duration
+        valid_dels = []
         for d in sorted_dels:
-            # Skip segments shorter than minimum (preserve important fragments)
             segment_duration_ms = (d.end - d.start) * 1000
-            if segment_duration_ms < min_deletion_ms:
-                continue
+            if segment_duration_ms >= min_deletion_ms:
+                valid_dels.append(d)
 
-            # Apply asymmetric padding: shrink the deletion to preserve word boundaries
-            # padding_start_ms: extra time BEFORE the cut (preserve ending of previous speech)
-            # padding_end_ms: extra time AFTER the cut (preserve beginning of next speech)
-            padded_start = d.start + (padding_start_ms / 1000.0)
-            padded_end = d.end - (padding_end_ms / 1000.0)
+        if not valid_dels:
+            audio.export(output_path, format="wav")
+            return output_path
+
+        # Calculate keep regions (inverse of deletions)
+        keep_regions = []  # List of (start_sec, end_sec, original_gap_after_ms)
+        current_pos = 0.0
+
+        for i, d in enumerate(valid_dels):
+            if d.start > current_pos:
+                # Calculate the original gap that will exist after this keep region
+                original_gap_ms = (d.end - d.start) * 1000
+                keep_regions.append({
+                    'start': current_pos,
+                    'end': d.start,
+                    'original_gap_ms': original_gap_ms
+                })
+            current_pos = max(current_pos, d.end)
+
+        # Add final region after last deletion
+        if current_pos < audio_len_sec:
+            keep_regions.append({
+                'start': current_pos,
+                'end': audio_len_sec,
+                'original_gap_ms': 0  # No gap after last segment
+            })
+
+        if not keep_regions:
+            result = AudioSegment.silent(duration=100)
+            result.export(output_path, format="wav")
+            return output_path
+
+        # Apply padding with NO-COLLISION rule
+        padded_regions = []
+        for i, region in enumerate(keep_regions):
+            # Apply padding
+            padded_start = region['start'] - (padding_start_ms / 1000.0)
+            padded_end = region['end'] + (padding_end_ms / 1000.0)
 
             # Clamp to audio bounds
             padded_start = max(0, padded_start)
             padded_end = min(audio_len_sec, padded_end)
 
-            # Ensure the deletion is still valid after padding
-            if padded_start >= padded_end:
-                # Deletion too small after padding, skip it
-                continue
+            # NO-COLLISION: Check against previous region
+            if padded_regions:
+                prev = padded_regions[-1]
+                if padded_start < prev['padded_end']:
+                    # Collision detected! Calculate midpoint
+                    midpoint = (prev['end'] + region['start']) / 2
+                    # Clip both regions to midpoint
+                    prev['padded_end'] = midpoint
+                    padded_start = midpoint
+                    self.log(f"  Collision prevented: adjusted gap between segments")
 
-            if merged_dels and padded_start <= merged_dels[-1][1]:
-                # Overlaps with previous, extend it
-                merged_dels[-1] = (merged_dels[-1][0], max(merged_dels[-1][1], padded_end))
-            else:
-                merged_dels.append((padded_start, padded_end))
+            padded_regions.append({
+                'start': region['start'],
+                'end': region['end'],
+                'padded_start': padded_start,
+                'padded_end': padded_end,
+                'original_gap_ms': region['original_gap_ms']
+            })
 
-        if not merged_dels:
-            # No deletions to apply
-            audio.export(output_path, format="wav")
-            return output_path
+        # Extract audio segments
+        segments_with_gaps = []
+        for i, region in enumerate(padded_regions):
+            start_ms = int(region['padded_start'] * 1000)
+            end_ms = int(region['padded_end'] * 1000)
 
-        # Build output by keeping non-deleted parts with crossfade
-        segments_to_keep = []
-        current_pos = 0.0
+            # Clamp to audio bounds
+            start_ms = max(0, start_ms)
+            end_ms = min(audio_len_ms, end_ms)
 
-        for del_start, del_end in merged_dels:
-            if del_start > current_pos:
-                start_ms = int(current_pos * 1000)
-                end_ms = int(del_start * 1000)
-                # Clamp to audio bounds
-                start_ms = max(0, start_ms)
-                end_ms = min(audio_len_ms, end_ms)
-                if end_ms > start_ms:
-                    segments_to_keep.append(audio[start_ms:end_ms])
-            current_pos = max(current_pos, del_end)
+            if end_ms > start_ms:
+                segment = audio[start_ms:end_ms]
 
-        # Keep audio after last deletion
-        if current_pos * 1000 < audio_len_ms:
-            start_ms = int(current_pos * 1000)
-            segments_to_keep.append(audio[start_ms:])
+                # Calculate the gap to insert AFTER this segment
+                gap_ms = 0
+                if i < len(padded_regions) - 1:
+                    original_gap = region['original_gap_ms']
+                    if original_gap >= long_gap_threshold_ms:
+                        # Long gap: normalize to exactly 1000ms
+                        gap_ms = long_gap_threshold_ms
+                        self.log(f"  Gap after segment {i+1} adjusted to 1s (original was >{long_gap_threshold_ms}ms)")
+                    else:
+                        # Short gap: ensure minimum
+                        gap_ms = max(min_gap_ms, int(original_gap * 0.5))
 
-        # Join segments with crossfade for smooth "natural breath" transitions
-        if not segments_to_keep:
-            # Everything was deleted, return silent audio
+                segments_with_gaps.append({
+                    'audio': segment,
+                    'gap_after_ms': gap_ms
+                })
+
+        # Join segments with gaps and crossfade
+        if not segments_with_gaps:
             result = AudioSegment.silent(duration=100)
-        elif len(segments_to_keep) == 1:
-            result = segments_to_keep[0]
+        elif len(segments_with_gaps) == 1:
+            result = segments_with_gaps[0]['audio']
         else:
-            result = segments_to_keep[0]
-            for seg in segments_to_keep[1:]:
-                # Apply crossfade if both segments are long enough
-                if len(result) >= crossfade_ms and len(seg) >= crossfade_ms:
-                    result = result.append(seg, crossfade=crossfade_ms)
+            result = segments_with_gaps[0]['audio']
+
+            for i, item in enumerate(segments_with_gaps[1:], 1):
+                seg = item['audio']
+                prev_gap = segments_with_gaps[i-1]['gap_after_ms']
+
+                # Add silence gap if needed
+                if prev_gap > 0:
+                    # When adding a gap, no crossfade needed
+                    silence = AudioSegment.silent(duration=prev_gap)
+                    result = result + silence + seg
                 else:
-                    result = result + seg
+                    # No gap: use crossfade for smooth transition
+                    # But reduce crossfade if segments are short to prevent overlap
+                    effective_crossfade = min(crossfade_ms, len(result) // 4, len(seg) // 4)
+                    if effective_crossfade > 0 and len(result) >= effective_crossfade and len(seg) >= effective_crossfade:
+                        result = result.append(seg, crossfade=effective_crossfade)
+                    else:
+                        result = result + seg
 
         result.export(output_path, format="wav")
         return output_path
