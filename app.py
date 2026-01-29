@@ -150,6 +150,7 @@ def render_upload_phase():
                         input_path=wav_path,
                         temp_dir=temp_dir,
                         remove_noise=remove_noise,
+                        silence_threshold_db=float(silence_threshold),
                         language=language if language != "auto" else None,
                         progress_callback=update_progress,
                     )
@@ -315,7 +316,6 @@ def process_final_audio():
                     input_path=st.session_state.prepared_audio_path,
                     output_path=output_path,
                     deletions=all_deletions,
-                    silence_threshold_db=float(st.session_state.silence_threshold),
                     progress_callback=update_progress,
                 )
 
