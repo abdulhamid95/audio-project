@@ -2,6 +2,20 @@
 
 from dataclasses import dataclass
 from faster_whisper import WhisperModel
+import torch
+
+
+def detect_device() -> tuple[str, str]:
+    """
+    Detect available hardware and return optimal device/compute settings.
+
+    Returns:
+        Tuple of (device, compute_type) for WhisperModel initialization.
+    """
+    if torch.cuda.is_available():
+        return "cuda", "float16"
+    else:
+        return "cpu", "int8"
 
 
 @dataclass
@@ -28,34 +42,43 @@ def transcribe_audio(
         audio_path: Path to the audio file.
         model_size: Whisper model size ('tiny', 'base', 'small', 'medium', 'large-v2').
                    'base' offers good balance of speed and accuracy.
-        language: Language code (e.g., 'en'). If None, auto-detects.
+        language: Language code (e.g., 'en', 'ar'). If None, auto-detects.
         device: Device to use ('cpu', 'cuda', or 'auto').
 
     Returns:
         List of Segment objects with text and timestamps.
     """
-    # Determine compute type based on device
+    # Auto-detect optimal device and compute type
     if device == "auto":
-        compute_type = "int8"  # Works on both CPU and GPU
+        detected_device, compute_type = detect_device()
     elif device == "cuda":
+        detected_device = "cuda"
         compute_type = "float16"
     else:
+        detected_device = "cpu"
         compute_type = "int8"
 
-    # Initialize the model
+    # Initialize the model with optimal settings
     model = WhisperModel(
         model_size,
-        device="cpu" if device == "auto" else device,
+        device=detected_device,
         compute_type=compute_type,
     )
 
-    # Transcribe with word timestamps
-    segments_generator, info = model.transcribe(
-        audio_path,
-        language=language,
-        word_timestamps=True,
-        vad_filter=True,  # Filter out silence
-    )
+    # Build transcription kwargs with optimized settings
+    transcribe_kwargs = {
+        "language": language,
+        "word_timestamps": True,
+        "vad_filter": True,  # Filter out silence
+        "beam_size": 1,  # Faster decoding with greedy search
+    }
+
+    # Add Arabic-specific prompt for better recognition
+    if language == "ar":
+        transcribe_kwargs["initial_prompt"] = "اللغة العربية الفصحى"
+
+    # Transcribe with optimized settings
+    segments_generator, info = model.transcribe(audio_path, **transcribe_kwargs)
 
     # Convert to our Segment format
     segments = []
@@ -90,13 +113,22 @@ def get_words_with_timestamps(
     Returns:
         List of dicts: [{'word': str, 'start': float, 'end': float}, ...]
     """
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    # Auto-detect optimal device and compute type
+    detected_device, compute_type = detect_device()
+    model = WhisperModel(model_size, device=detected_device, compute_type=compute_type)
 
-    segments_generator, _ = model.transcribe(
-        audio_path,
-        language=language,
-        word_timestamps=True,
-    )
+    # Build transcription kwargs with optimized settings
+    transcribe_kwargs = {
+        "language": language,
+        "word_timestamps": True,
+        "beam_size": 1,  # Faster decoding
+    }
+
+    # Add Arabic-specific prompt for better recognition
+    if language == "ar":
+        transcribe_kwargs["initial_prompt"] = "اللغة العربية الفصحى"
+
+    segments_generator, _ = model.transcribe(audio_path, **transcribe_kwargs)
 
     words = []
     for segment in segments_generator:

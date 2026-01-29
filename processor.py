@@ -12,6 +12,34 @@ from scipy.io import wavfile
 import noisereduce as nr
 from pydub import AudioSegment
 from faster_whisper import WhisperModel
+import torch
+
+
+def detect_device() -> tuple[str, str]:
+    """
+    Detect available hardware and return optimal device/compute settings.
+
+    Returns:
+        Tuple of (device, compute_type) for WhisperModel initialization.
+    """
+    if torch.cuda.is_available():
+        return "cuda", "float16"
+    else:
+        return "cpu", "int8"
+
+
+def create_optimized_whisper_model(model_size: str = "base") -> WhisperModel:
+    """
+    Create a WhisperModel with optimal settings for available hardware.
+
+    Args:
+        model_size: Whisper model size (tiny, base, small, medium, large-v2, etc.)
+
+    Returns:
+        Configured WhisperModel instance.
+    """
+    device, compute_type = detect_device()
+    return WhisperModel(model_size, device=device, compute_type=compute_type)
 
 
 @dataclass
@@ -103,6 +131,11 @@ class AudioProcessor:
         """
         Run the complete processing pipeline (non-interactive mode).
 
+        Pipeline order optimized for speed:
+        A. Noise Reduction
+        B. Silence Removal (BEFORE transcription to reduce Whisper workload)
+        C. Repetition Detection & Removal
+
         Args:
             input_path: Path to input WAV file.
             output_path: Path for output WAV file.
@@ -118,23 +151,35 @@ class AudioProcessor:
         update = progress_callback or (lambda x: None)
         current_path = input_path
 
-        # Step A: Noise Reduction (0-30%)
+        # Step A: Noise Reduction (0-25%)
         if remove_noise:
             self.log("Applying noise reduction...")
             update(0.1)
             denoised_path = output_path.replace(".wav", "_denoised.wav")
             current_path = self._reduce_noise(current_path, denoised_path)
             self.log("Noise reduction complete.")
-            update(0.3)
+            update(0.25)
 
-        # Step B: Repetition Removal (30-70%)
+        # Step B: Silence Removal (25-40%) - BEFORE transcription for speed
+        self.log("Detecting and trimming silences...")
+        update(0.3)
+        trimmed_path = output_path.replace(".wav", "_trimmed.wav")
+        current_path = self._trim_silences(
+            current_path,
+            trimmed_path,
+            threshold_db=silence_threshold_db
+        )
+        self.log("Silence trimming complete.")
+        update(0.4)
+
+        # Step C: Repetition Removal (40-100%)
         if remove_repetitions:
             lang_str = language if language else "auto-detect"
             self.log(f"Transcribing audio with Whisper AI (language: {lang_str})...")
-            update(0.35)
+            update(0.45)
             segments = self._transcribe(current_path, language=language)
             self.log(f"Found {len(segments)} speech segments.")
-            update(0.5)
+            update(0.7)
 
             self.log("Analyzing for repetitions and false starts...")
             deletions = self._detect_repetitions(segments)
@@ -144,23 +189,19 @@ class AudioProcessor:
                 for d in deletions:
                     self.log(f"  - {d.reason}")
 
-                no_rep_path = output_path.replace(".wav", "_norep.wav")
-                current_path = self._remove_segments(current_path, no_rep_path, deletions)
+                current_path = self._remove_segments(current_path, output_path, deletions)
                 self.log("Repetitions removed.")
             else:
                 self.log("No repetitions detected.")
-            update(0.7)
-
-        # Step C: Silence Removal (70-100%)
-        self.log("Detecting and trimming silences...")
-        update(0.75)
-        current_path = self._trim_silences(
-            current_path,
-            output_path,
-            threshold_db=silence_threshold_db
-        )
-        self.log("Silence trimming complete.")
-        update(1.0)
+                # Copy to final output path if no deletions
+                audio = AudioSegment.from_wav(current_path)
+                audio.export(output_path, format="wav")
+            update(1.0)
+        else:
+            # No repetition removal, copy to final output
+            audio = AudioSegment.from_wav(current_path)
+            audio.export(output_path, format="wav")
+            update(1.0)
 
         return output_path
 
@@ -169,11 +210,17 @@ class AudioProcessor:
         input_path: str,
         temp_dir: str,
         remove_noise: bool = True,
+        silence_threshold_db: float = -40.0,
         language: str | None = "ar",
         progress_callback: Callable[[float], None] | None = None,
     ) -> tuple[str, RepetitionAnalysis | None]:
         """
         Phase 1: Prepare audio and analyze repetitions (interactive mode).
+
+        Pipeline order optimized for speed:
+        A. Noise Reduction
+        B. Silence Removal (BEFORE transcription to reduce Whisper workload)
+        C. Transcription & Analysis
 
         Returns:
             Tuple of (prepared_audio_path, repetition_analysis or None)
@@ -181,22 +228,34 @@ class AudioProcessor:
         update = progress_callback or (lambda x: None)
         current_path = input_path
 
-        # Step A: Noise Reduction (0-30%)
+        # Step A: Noise Reduction (0-20%)
         if remove_noise:
             self.log("Applying noise reduction...")
             update(0.1)
             denoised_path = os.path.join(temp_dir, "denoised.wav")
             current_path = self._reduce_noise(current_path, denoised_path)
             self.log("Noise reduction complete.")
-            update(0.3)
+            update(0.2)
 
-        # Step B: Transcription and Analysis (30-60%)
+        # Step B: Silence Removal (20-35%) - BEFORE transcription for speed
+        self.log("Detecting and trimming silences...")
+        update(0.25)
+        trimmed_path = os.path.join(temp_dir, "trimmed.wav")
+        current_path = self._trim_silences(
+            current_path,
+            trimmed_path,
+            threshold_db=silence_threshold_db
+        )
+        self.log("Silence trimming complete.")
+        update(0.35)
+
+        # Step C: Transcription and Analysis (35-60%)
         lang_str = language if language else "auto-detect"
         self.log(f"Transcribing audio with Whisper AI (language: {lang_str})...")
-        update(0.35)
+        update(0.4)
         segments = self._transcribe(current_path, language=language)
         self.log(f"Found {len(segments)} speech segments.")
-        update(0.5)
+        update(0.55)
 
         self.log("Analyzing for repetitions (three-tier system)...")
         analysis = self.analyze_repetitions(segments)
@@ -213,17 +272,17 @@ class AudioProcessor:
         input_path: str,
         output_path: str,
         deletions: list[DeletionRange],
-        silence_threshold_db: float = -40.0,
         progress_callback: Callable[[float], None] | None = None,
     ) -> str:
         """
         Phase 2: Apply deletions and finalize audio (interactive mode).
 
+        Note: Silence removal is now done in phase 1 (before transcription) for speed.
+
         Args:
-            input_path: Path to prepared audio (from phase 1).
+            input_path: Path to prepared audio (from phase 1, already silence-trimmed).
             output_path: Path for final output.
             deletions: Combined list of all confirmed deletions.
-            silence_threshold_db: Threshold for silence detection.
             progress_callback: Function(progress: float) for updates.
 
         Returns:
@@ -232,28 +291,19 @@ class AudioProcessor:
         update = progress_callback or (lambda x: None)
         current_path = input_path
 
-        # Apply deletions (60-80%)
+        # Apply deletions (60-100%)
         if deletions:
             self.log(f"Removing {len(deletions)} confirmed segments...")
-            update(0.65)
-            no_rep_path = output_path.replace(".wav", "_norep.wav")
-            current_path = self._remove_segments(current_path, no_rep_path, deletions)
+            update(0.7)
+            current_path = self._remove_segments(current_path, output_path, deletions)
             self.log("Segments removed.")
-            update(0.8)
+            update(1.0)
         else:
             self.log("No segments to remove.")
-            update(0.8)
-
-        # Silence Removal (80-100%)
-        self.log("Detecting and trimming silences...")
-        update(0.85)
-        current_path = self._trim_silences(
-            current_path,
-            output_path,
-            threshold_db=silence_threshold_db
-        )
-        self.log("Silence trimming complete.")
-        update(1.0)
+            # Copy to final output
+            audio = AudioSegment.from_wav(current_path)
+            audio.export(output_path, format="wav")
+            update(1.0)
 
         return output_path
 
@@ -303,7 +353,7 @@ class AudioProcessor:
         return output_path
 
     def _transcribe(self, audio_path: str, language: str | None = "ar") -> list[Segment]:
-        """Transcribe audio using Whisper.
+        """Transcribe audio using Whisper with optimized settings.
 
         Args:
             audio_path: Path to audio file.
@@ -312,20 +362,26 @@ class AudioProcessor:
         transcribe_kwargs = {
             "word_timestamps": True,
             "vad_filter": True,
+            "beam_size": 1,  # Faster decoding with greedy search
         }
         if language:
             transcribe_kwargs["language"] = language
+            # Arabic-specific prompt for better recognition
+            if language == "ar":
+                transcribe_kwargs["initial_prompt"] = "اللغة العربية الفصحى"
 
         segments_gen, info = self.model.transcribe(audio_path, **transcribe_kwargs)
         self.log(f"Detected language: {info.language} (probability: {info.language_probability:.0%})")
 
         segments = []
-        for seg in segments_gen:
+        for i, seg in enumerate(segments_gen):
             text = seg.text.strip()
             if text:
                 start = seg.words[0].start if seg.words else seg.start
                 end = seg.words[-1].end if seg.words else seg.end
                 segments.append(Segment(text=text, start=start, end=end))
+                # Streaming log: update UI as each segment is processed
+                self.log(f"  Segment {i+1}: {text[:40]}{'...' if len(text) > 40 else ''}")
 
         return segments
 

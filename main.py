@@ -98,7 +98,20 @@ def process_audio(
             )
             log("  Noise reduction complete", verbose)
 
-        # Step 3: Transcription and repetition removal
+        # Step 3: Silence trimming (BEFORE transcription for speed)
+        # Removing silence first reduces the audio duration Whisper needs to process
+        if not skip_silence:
+            log("Trimming long silences...", verbose)
+            trimmed_path = os.path.join(temp_dir, "03_trimmed.wav")
+            current_file, trimmed = trim_silences(
+                current_file,
+                trimmed_path,
+                min_silence_ms=min_silence_ms,
+                target_silence_ms=target_silence_ms,
+            )
+            log(f"  Trimmed {trimmed:.1f} seconds of silence", verbose)
+
+        # Step 4: Transcription and repetition removal
         if not skip_repetitions:
             log(f"Transcribing audio (model: {whisper_model})...", verbose)
             segments = transcribe_audio(current_file, model_size=whisper_model)
@@ -116,7 +129,7 @@ def process_audio(
                     log(f"    {cut.start:.1f}s - {cut.end:.1f}s: {cut.reason[:60]}", verbose)
 
                 log("Removing repetitions...", verbose)
-                no_rep_path = os.path.join(temp_dir, "03_no_repetitions.wav")
+                no_rep_path = os.path.join(temp_dir, "04_no_repetitions.wav")
                 current_file, removed = remove_repetitions(
                     current_file,
                     no_rep_path,
@@ -125,18 +138,6 @@ def process_audio(
                 log(f"  Removed {removed:.1f} seconds of repetitions", verbose)
             else:
                 log("  No repetitions detected", verbose)
-
-        # Step 4: Silence trimming
-        if not skip_silence:
-            log("Trimming long silences...", verbose)
-            trimmed_path = os.path.join(temp_dir, "04_trimmed.wav")
-            current_file, trimmed = trim_silences(
-                current_file,
-                trimmed_path,
-                min_silence_ms=min_silence_ms,
-                target_silence_ms=target_silence_ms,
-            )
-            log(f"  Trimmed {trimmed:.1f} seconds of silence", verbose)
 
         # Copy final result to output path
         log(f"Saving output to: {output_path}", verbose)
