@@ -101,12 +101,6 @@ def render_upload_phase():
             help="Select the language of your audio. Arabic is optimized for best results."
         )
 
-        remove_noise = st.checkbox(
-            "Remove Noise",
-            value=True,
-            help="Apply noise reduction using the first 0.5s as noise profile."
-        )
-
         silence_threshold = st.slider(
             "Silence Threshold (dB)",
             min_value=-60,
@@ -187,7 +181,6 @@ def render_upload_phase():
                     prepared_path, analysis = processor.process_phase1_prepare(
                         input_path=wav_path,
                         temp_dir=temp_dir,
-                        remove_noise=remove_noise,
                         silence_threshold_db=float(silence_threshold),
                         language=language if language != "auto" else None,
                         progress_callback=update_progress,
