@@ -11,7 +11,6 @@ from typing import Callable
 
 import numpy as np
 from scipy.io import wavfile
-import noisereduce as nr
 from pydub import AudioSegment
 from faster_whisper import WhisperModel
 
@@ -102,9 +101,8 @@ class AudioProcessor:
     Audio processing pipeline implementing "The Last Take Strategy".
 
     Pipeline:
-    A. Noise Reduction
+    A. Silence Removal
     B. Smart Repetition Removal
-    C. Silence Removal
     """
 
     def __init__(
@@ -126,7 +124,6 @@ class AudioProcessor:
         self,
         input_path: str,
         output_path: str,
-        remove_noise: bool = True,
         remove_repetitions: bool = True,
         silence_threshold_db: float = -50.0,
         language: str | None = "ar",
@@ -136,14 +133,12 @@ class AudioProcessor:
         Run the complete processing pipeline (non-interactive mode).
 
         Pipeline order optimized for speed:
-        A. Noise Reduction
-        B. Silence Removal (BEFORE transcription to reduce Whisper workload)
-        C. Repetition Detection & Removal
+        A. Silence Removal (BEFORE transcription to reduce Whisper workload)
+        B. Repetition Detection & Removal
 
         Args:
             input_path: Path to input WAV file.
             output_path: Path for output WAV file.
-            remove_noise: Whether to apply noise reduction.
             remove_repetitions: Whether to detect and remove repetitions.
             silence_threshold_db: Threshold for silence detection.
             language: Language code for transcription (default "ar" for Arabic).
@@ -155,18 +150,9 @@ class AudioProcessor:
         update = progress_callback or (lambda x: None)
         current_path = input_path
 
-        # Step A: Noise Reduction (0-25%)
-        if remove_noise:
-            self.log("Applying noise reduction...")
-            update(0.1)
-            denoised_path = output_path.replace(".wav", "_denoised.wav")
-            current_path = self._reduce_noise(current_path, denoised_path)
-            self.log("Noise reduction complete.")
-            update(0.25)
-
-        # Step B: Silence Removal (25-40%) - BEFORE transcription for speed
+        # Step A: Silence Removal (0-30%) - BEFORE transcription for speed
         self.log("Detecting and trimming silences...")
-        update(0.3)
+        update(0.1)
         trimmed_path = output_path.replace(".wav", "_trimmed.wav")
         current_path = self._trim_silences(
             current_path,
@@ -174,9 +160,9 @@ class AudioProcessor:
             threshold_db=silence_threshold_db
         )
         self.log("Silence trimming complete.")
-        update(0.4)
+        update(0.3)
 
-        # Step C: Repetition Removal (40-100%)
+        # Step B: Repetition Removal (30-100%)
         if remove_repetitions:
             lang_str = language if language else "auto-detect"
             self.log(f"Transcribing audio with Whisper AI (language: {lang_str})...")
@@ -213,7 +199,6 @@ class AudioProcessor:
         self,
         input_path: str,
         temp_dir: str,
-        remove_noise: bool = True,
         silence_threshold_db: float = -50.0,
         language: str | None = "ar",
         progress_callback: Callable[[float], None] | None = None,
@@ -222,9 +207,8 @@ class AudioProcessor:
         Phase 1: Prepare audio and analyze repetitions (interactive mode).
 
         Pipeline order optimized for speed:
-        A. Noise Reduction
-        B. Silence Removal (BEFORE transcription to reduce Whisper workload)
-        C. Transcription & Analysis
+        A. Silence Removal (BEFORE transcription to reduce Whisper workload)
+        B. Transcription & Analysis
 
         Returns:
             Tuple of (prepared_audio_path, repetition_analysis or None)
@@ -232,18 +216,9 @@ class AudioProcessor:
         update = progress_callback or (lambda x: None)
         current_path = input_path
 
-        # Step A: Noise Reduction (0-20%)
-        if remove_noise:
-            self.log("Applying noise reduction...")
-            update(0.1)
-            denoised_path = os.path.join(temp_dir, "denoised.wav")
-            current_path = self._reduce_noise(current_path, denoised_path)
-            self.log("Noise reduction complete.")
-            update(0.2)
-
-        # Step B: Silence Removal (20-35%) - BEFORE transcription for speed
+        # Step A: Silence Removal (0-25%) - BEFORE transcription for speed
         self.log("Detecting and trimming silences...")
-        update(0.25)
+        update(0.1)
         trimmed_path = os.path.join(temp_dir, "trimmed.wav")
         current_path = self._trim_silences(
             current_path,
@@ -251,7 +226,7 @@ class AudioProcessor:
             threshold_db=silence_threshold_db
         )
         self.log("Silence trimming complete.")
-        update(0.35)
+        update(0.25)
 
         # Step C: Transcription and Analysis (35-60%)
         lang_str = language if language else "auto-detect"
@@ -308,51 +283,6 @@ class AudioProcessor:
             audio = AudioSegment.from_wav(current_path)
             audio.export(output_path, format="wav")
             update(1.0)
-
-        return output_path
-
-    def _reduce_noise(
-        self,
-        input_path: str,
-        output_path: str,
-        noise_sample_seconds: float = 0.5
-    ) -> str:
-        """Apply noise reduction using noisereduce."""
-        sample_rate, audio_data = wavfile.read(input_path)
-
-        # Convert to float
-        if audio_data.dtype == np.int16:
-            audio_float = audio_data.astype(np.float32) / 32768.0
-        elif audio_data.dtype == np.int32:
-            audio_float = audio_data.astype(np.float32) / 2147483648.0
-        else:
-            audio_float = audio_data.astype(np.float32)
-
-        # Handle stereo
-        if len(audio_float.shape) > 1:
-            audio_float = np.mean(audio_float, axis=1)
-
-        # Use first N seconds as noise profile
-        noise_samples = int(noise_sample_seconds * sample_rate)
-        noise_clip = audio_float[:noise_samples]
-
-        # Apply noise reduction
-        reduced = nr.reduce_noise(
-            y=audio_float,
-            sr=sample_rate,
-            y_noise=noise_clip,
-            prop_decrease=0.8,
-            stationary=True,
-        )
-
-        # Normalize
-        max_val = np.max(np.abs(reduced))
-        if max_val > 0:
-            reduced = reduced / max_val * 0.95
-
-        # Save
-        reduced_int = (reduced * 32767).astype(np.int16)
-        wavfile.write(output_path, sample_rate, reduced_int)
 
         return output_path
 
